@@ -1,17 +1,20 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-import os
 import pandas as pd
 from PIL import Image
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
 from sklearn.model_selection import train_test_split
-# در ابتدای فایل
 from torch.amp import GradScaler, autocast
 from torchvision.models import resnet50, ResNet50_Weights
+
+# ---- ایمپورت‌های ضروری برای DDP ----
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 class FaceDataset(Dataset):
     def __init__(self, data_frame, root_dir, transform=None, img_column='images_id'):
@@ -52,6 +55,8 @@ class Dataset_selector:
         num_workers=4,
         pin_memory=True,
         ddp=False,
+        rank=0,
+        world_size=1
     ):
         if dataset_mode not in ['140k', '190k', '200k']:
             raise ValueError("dataset_mode must be  '140k', '190k', '200k'")
@@ -60,14 +65,11 @@ class Dataset_selector:
         image_size = (256, 256) if dataset_mode in ['140k', '190k', '200k'] else (300, 300)
 
         if dataset_mode == '140k':
-            mean = (0.5207, 0.4258, 0.3806)
-            std = (0.2490, 0.2239, 0.2212)
+            mean, std = (0.5207, 0.4258, 0.3806), (0.2490, 0.2239, 0.2212)
         elif dataset_mode == '200k':
-            mean = (0.4460, 0.3622, 0.3416)
-            std = (0.2057, 0.1849, 0.1761)
+            mean, std = (0.4460, 0.3622, 0.3416), (0.2057, 0.1849, 0.1761)
         elif dataset_mode == '190k':
-            mean = (0.4668, 0.3816, 0.3414)
-            std = (0.2410, 0.2161, 0.2081)
+            mean, std = (0.4668, 0.3816, 0.3414), (0.2410, 0.2161, 0.2081)
 
         transform_train = transforms.Compose([
             transforms.Resize(image_size),
@@ -84,32 +86,24 @@ class Dataset_selector:
         ])
 
         img_column = 'path' if dataset_mode in ['140k'] else 'images_id'
-
         root_dir = None
         train_data = val_data = test_data = None
 
         if dataset_mode == '140k':
-            if not realfake140k_train_csv or not realfake140k_valid_csv or not realfake140k_test_csv or not realfake140k_root_dir:
-                raise ValueError("realfake140k_train_csv, realfake140k_valid_csv, realfake140k_test_csv, and realfake140k_root_dir must be provided")
-            train_data = pd.read_csv(realfake140k_train_csv)
-            val_data = pd.read_csv(realfake140k_valid_csv)
-            test_data = pd.read_csv(realfake140k_test_csv)
+            if not all([realfake140k_train_csv, realfake140k_valid_csv, realfake140k_test_csv, realfake140k_root_dir]):
+                raise ValueError("140k paths missing")
+            train_data = pd.read_csv(realfake140k_train_csv).sample(frac=1, random_state=3407).reset_index(drop=True)
+            val_data = pd.read_csv(realfake140k_valid_csv).sample(frac=1, random_state=3407).reset_index(drop=True)
+            test_data = pd.read_csv(realfake140k_test_csv).sample(frac=1, random_state=3407).reset_index(drop=True)
             root_dir = os.path.join(realfake140k_root_dir, 'real_vs_fake', 'real-vs-fake')
-            if 'path' not in train_data.columns:
-                raise ValueError("CSV files for 140k dataset must contain a 'path' column")
-            train_data = train_data.sample(frac=1, random_state=3407).reset_index(drop=True)
-            val_data = val_data.sample(frac=1, random_state=3407).reset_index(drop=True)
-            test_data = test_data.sample(frac=1, random_state=3407).reset_index(drop=True)
 
         elif dataset_mode == '200k':
-            if not realfake200k_train_csv or not realfake200k_val_csv or not realfake200k_test_csv or not realfake200k_root_dir:
-                raise ValueError("realfake200k_train_csv, realfake200k_val_csv, realfake200k_test_csv, and realfake200k_root_dir must be provided")
-
+            if not all([realfake200k_train_csv, realfake200k_val_csv, realfake200k_test_csv, realfake200k_root_dir]):
+                raise ValueError("200k paths missing")
             train_data = pd.read_csv(realfake200k_train_csv)
             val_data = pd.read_csv(realfake200k_val_csv)
             test_data = pd.read_csv(realfake200k_test_csv)
-
-            root_dir = realfake200k_root_dir  # /kaggle/input/undersampled-200k/balanced_unique_200k_dataset
+            root_dir = realfake200k_root_dir
 
             def create_image_path(row, split):
                 folder = 'real' if row['label'] in [1, 'real', 'Real'] else 'fake'
@@ -122,7 +116,7 @@ class Dataset_selector:
 
         elif dataset_mode == '190k':
             if not realfake190k_root_dir:
-                raise ValueError("realfake190k_root_dir must be provided")
+                raise ValueError("190k path missing")
             root_dir = realfake190k_root_dir
             def collect_images_from_folder(split):
                 data = []
@@ -132,49 +126,32 @@ class Dataset_selector:
                         raise FileNotFoundError(f"Folder not found: {folder_path}")
                     for img_name in os.listdir(folder_path):
                         if img_name.endswith(('.jpg', '.jpeg', '.png')):
-                            img_path = os.path.join(split, label, img_name)
-                            data.append({'images_id': img_path, 'label': label})
+                            data.append({'images_id': os.path.join(split, label, img_name), 'label': label})
                 return pd.DataFrame(data)
-            train_data = collect_images_from_folder('Train')
-            val_data = collect_images_from_folder('Validation')
-            test_data = collect_images_from_folder('Test')
-            train_data = train_data.sample(frac=1, random_state=None).reset_index(drop=True)
-            val_data = val_data.sample(frac=1, random_state=None).reset_index(drop=True)
-            test_data = test_data.sample(frac=1, random_state=None).reset_index(drop=True)
-            
-        # Debug statistics
-        print(f"{dataset_mode} dataset statistics:")
-        print(f"Total train: {len(train_data)} | val: {len(val_data)} | test: {len(test_data)}")
-        print(f"Train label distribution:\n{train_data['label'].value_counts()}")
-        print(f"Val label distribution:\n{val_data['label'].value_counts()}")
-        print(f"Test label distribution:\n{test_data['label'].value_counts()}")
-
-        # Check missing images
-        #for split_name, data in [('train', train_data), ('val', val_data), ('test', test_data)]:
-    # استفاده از img_column به جای images_id
-         #   missing = [os.path.join(root_dir, p) for p in data[img_column] if not os.path.exists(os.path.join(root_dir, p))]
-          #  print(f"{split_name} missing images: {len(missing)}")
-           # if missing:
-            #    print(f"Sample missing: {missing[:3]}")
+            train_data = collect_images_from_folder('Train').sample(frac=1, random_state=None).reset_index(drop=True)
+            val_data = collect_images_from_folder('Validation').sample(frac=1, random_state=None).reset_index(drop=True)
+            test_data = collect_images_from_folder('Test').sample(frac=1, random_state=None).reset_index(drop=True)
 
         # Create datasets
         train_dataset = FaceDataset(train_data, root_dir, transform=transform_train, img_column=img_column)
         val_dataset = FaceDataset(val_data, root_dir, transform=transform_test, img_column=img_column)
         test_dataset = FaceDataset(test_data, root_dir, transform=transform_test, img_column=img_column)
 
-       
-        self.loader_train = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
+        # ---- تنظیمات DDP برای DataLoader ----
+        self.train_sampler = None
+        shuffle_train = True
+        
+        if ddp:
+            self.train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+            shuffle_train = False # وقتی sampler داریم، shuffle در DataLoader باید False باشد
+
+        self.loader_train = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=shuffle_train, 
+                                       num_workers=num_workers, pin_memory=pin_memory, sampler=self.train_sampler)
         self.loader_val = DataLoader(val_dataset, batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
         self.loader_test = DataLoader(test_dataset, batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
-        print(f"DataLoaders ready - Train batches: {len(self.loader_train)}, Val: {len(self.loader_val)}, Test: {len(self.loader_test)}")
-
-        # Test sample batch
-        try:
-            sample_train = next(iter(self.loader_train))
-            print(f"Sample train batch shape: {sample_train[0].shape}, labels: {sample_train[1][:5]}")
-        except Exception as e:
-            print(f"Error in train loader: {e}")
+        if rank == 0: # فقط در GPU اصلی لاگ بزن
+            print(f"DataLoaders ready - Train batches: {len(self.loader_train)}, Val: {len(self.loader_val)}, Test: {len(self.loader_test)}")
 
 # ====================== KD Losses ======================
 def logits_loss(teacher_logits, student_logits, T=4.0):
@@ -217,34 +194,23 @@ class RKDLoss(nn.Module):
 
 # ====================== Models ======================
 class ResNetTeacher(nn.Module):
-    """معلم: ResNet-50"""
     def __init__(self):
         super().__init__()
-        # در کلاس ResNetTeacher
-
-        self.model = resnet50(weights=None) # یا ResNet50_Weights.DEFAULT اگر می‌خواهید وزن‌های پیش‌فرض داشته باشد
+        self.model = resnet50(weights=None)
         self.model.fc = nn.Linear(self.model.fc.in_features, 1)
-        
         self.features = []
         def hook_fn(module, input, output):
             self.features.append(output)
         self.model.layer2[-1].register_forward_hook(hook_fn)
         self.model.layer3[-1].register_forward_hook(hook_fn)
         self.model.layer4[-1].register_forward_hook(hook_fn)
-        # در __init__ کلاس ResNetTeacher:
-        self.model.eval() # اضافه کردن این خط
+        self.model.eval()
 
     def forward(self, x):
         self.features.clear()
         logit = self.model(x)
         return logit, self.features
 
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# کلاس پایه برای ResNet-20 (مخصوص کارهای KD و سبک‌سازی)
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
 
@@ -285,23 +251,18 @@ class ResNet20(nn.Module):
     def forward(self, x):
         x = self.relu(self.bn1(self.conv1(x)))
         x = self.layer1(x)
-        feat2 = self.layer2(x) # Hook point
-        feat3 = self.layer3(feat2) # Hook point
+        feat2 = self.layer2(x)
+        feat3 = self.layer3(feat2)
         x = self.avgpool(feat3)
         return self.fc(x.view(x.size(0), -1))
-
 
 class ResNetStudent(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = ResNet20() # استفاده از مدل بالا
-        
-        # ثبت هوک‌ها
+        self.model = ResNet20()
         self.features = []
         def hook_fn(module, input, output):
             self.features.append(output)
-
-        # در کلاس ResNetStudent:
         self.model.layer1.register_forward_hook(hook_fn) 
         self.model.layer2.register_forward_hook(hook_fn)
         self.model.layer3.register_forward_hook(hook_fn)
@@ -312,10 +273,14 @@ class ResNetStudent(nn.Module):
         return logit, self.features
 
 # ====================== Training Function ======================
-def train_student(teacher_path, dataset_mode, kd_method='logits',
-                  epochs=30, lr=0.005, device='cuda', batch_size=64):
+def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
+                  epochs=30, lr=0.005, batch_size=64):
     
-    # 1. تنظیمات اولیه
+    # 1. تنظیمات اولیه DDP
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f'cuda:{local_rank}')
+    
+    # 2. آماده سازی معلم
     teacher = ResNetTeacher().to(device)
     ckpt = torch.load(teacher_path, map_location=device)
     state = ckpt.get('state_dict') or ckpt.get('model') or ckpt
@@ -324,56 +289,71 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
     for p in teacher.parameters():
         p.requires_grad = False
 
+    # 3. آماده سازی دانش‌آموز
     student = ResNetStudent().to(device)
+    
+    # 4. پیچیدن مدل‌ها در DDP
+    teacher = DDP(teacher, device_ids=[local_rank])
+    student = DDP(student, device_ids=[local_rank])
+
     optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.BCEWithLogitsLoss()
+    scaler = GradScaler('cuda')
     
-    # تعریف GradScaler برای Mixed Precision
-    scaler = GradScaler()
+    # اینسنتس کردن RKD خارج از حلقه برای جلوگیری از ایجاد مدل تکراری
+    rkd_criterion = RKDLoss().to(device) if kd_method == 'rkd' else None
 
-    # Dataset (توصیه: همه روی 200k)
+    # 5. لود دادهها با فعال بودن DDP
     if dataset_mode == '140k':
         ds = Dataset_selector(dataset_mode='140k', 
-                              realfake140k_train_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/train.csv', # مسیرها را پر کن
+                              realfake140k_train_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/train.csv',
                               realfake140k_valid_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/valid.csv',
                               realfake140k_test_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/test.csv',
                               realfake140k_root_dir='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces',
-                              train_batch_size=batch_size, eval_batch_size=64, ddp=False)
+                              train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
     elif dataset_mode == '190k':
         ds = Dataset_selector(dataset_mode='190k',
                               realfake190k_root_dir='/kaggle/input/datasets/manjilkarki/deepfake-and-real-images/Dataset', 
-                              train_batch_size=batch_size, eval_batch_size=64, ddp=False)
+                              train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
     elif dataset_mode == '200k':
         ds = Dataset_selector(dataset_mode='200k',
                               realfake200k_val_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/val_labels.csv',
                               realfake200k_test_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/test_labels.csv',
                               realfake200k_train_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/train_labels.csv',
                               realfake200k_root_dir='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset',
-                              realfake190k_root_dir='/kaggle/input/datasets/manjilkarki/deepfake-and-real-images/Dataset',
-                              train_batch_size=batch_size, eval_batch_size=64, ddp=False)
-                      
+                              train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
+                              
     train_loader = ds.loader_train
+    train_sampler = ds.train_sampler
 
-    scaler = GradScaler('cuda')                  
     for epoch in range(epochs):
         student.train()
+        
+        # بسیار مهم: برای Shuffle کردن داده‌ها در هر ایپاک برای DDP
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+            
         running_loss = 0.0
         
-        for i, (images, labels) in tqdm(enumerate(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
+        # فقط در رنک صفر پراگرس بار را نشان بده تا لاگ‌ها به هم نریزد
+        data_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}") if local_rank == 0 else train_loader
+        
+        for i, (images, labels) in enumerate(data_iter):
             images = images.to(device)
             labels = labels.to(device).float().unsqueeze(1)
 
-
             with autocast('cuda'): 
                 with torch.no_grad():
-                    teacher_logits, teacher_feats = teacher(images)
+                    teacher_logits, _ = teacher(images)
+                    # دسترسی به فیچرهای هوک شده در DDP از طریق .module
+                    teacher_feats = teacher.module.features  
                 
-                student_logits, student_feats = student(images)
+                student_logits, _ = student(images)
+                student_feats = student.module.features 
                 
                 base_loss = criterion(student_logits, labels)
                 
-                # محاسبه Loss بر اساس متد انتخابی
                 if kd_method == 'logits':
                     kd_loss = logits_loss(teacher_logits, student_logits, T=4.0)
                     loss = 0.6 * base_loss + 0.4 * kd_loss
@@ -381,42 +361,53 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
                     kd_loss = at_loss(teacher_feats, student_feats)
                     loss = base_loss + 0.4 * kd_loss
                 elif kd_method == 'rkd':
-                    t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
-                    s_emb = student.model.avgpool(student_feats[-1]).flatten(1)
-                    rkd_loss = RKDLoss().to(device)(t_emb, s_emb)
-                    loss = base_loss + 0.5 * rkd_loss
+                    # دسترسی به avgpool از طریق .module در DDP
+                    t_emb = teacher.module.model.avgpool(teacher_feats[-1]).flatten(1)
+                    s_emb = student.module.model.avgpool(student_feats[-1]).flatten(1)
+                    rkd_loss_val = rkd_criterion(t_emb, s_emb)
+                    loss = base_loss + 0.5 * rkd_loss_val
 
-            # 3. بهینه‌سازی با Scaler
             optimizer.zero_grad()
-            # مقیاس‌بندی loss و انجام Backward
             scaler.scale(loss).backward()
-            # استپ کردن optimizer ( scaler خودش unscale را انجام می‌دهد)
             scaler.step(optimizer)
             scaler.update()
             
             running_loss += loss.item()
 
         scheduler.step()
-        print(f"Epoch {epoch+1}/{epochs} | Loss: {running_loss/len(train_loader):.4f}")
+        
+        if local_rank == 0:
+            print(f"Epoch {epoch+1}/{epochs} | Loss: {running_loss/len(train_loader):.4f}")
 
-    torch.save(student.state_dict(), f"student_{dataset_mode}_{kd_method}_amp.pth")
-    print(f"Model saved successfully.")
+    # ذخیره مدل فقط توسط GPU اصلی (رنک 0)
+    if local_rank == 0:
+        # دقت کنید که state_dict را از student.module می‌گیریم تا فرمت استاندارد ذخیره شود
+        torch.save(student.module.state_dict(), f"student_{dataset_mode}_{kd_method}_amp_ddp.pth")
+        print(f"Model saved successfully by Rank 0.")
 
 # ====================== اجرا ======================
 import argparse
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="KD Training")
+    parser = argparse.ArgumentParser(description="KD Training with DDP")
     parser.add_argument('--mode', type=str, required=True, help="140k, 190k, or 200k")
     parser.add_argument('--method', type=str, required=True, help="logits, at, or rkd")
     parser.add_argument('--path', type=str, required=True, help="Path to teacher pth")
     
     args = parser.parse_args()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # راه‌اندازی Process Group برای DDP
+    dist.init_process_group(backend="nccl")
+    
+    # گرفتن شماره GPU مربوط به این پردازش específico
+    local_rank = int(os.environ["LOCAL_RANK"])
     
     train_student(
+        local_rank=local_rank,
         teacher_path=args.path, 
         dataset_mode=args.mode, 
-        kd_method=args.method, 
-        device=device
+        kd_method=args.method
     )
+    
+    # پاکسازی منابع DDP
+    dist.destroy_process_group()
