@@ -6,10 +6,13 @@ import numpy as np
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
 
 class ResNetKD(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, arch='resnet50'): # اضافه کردن آرگومان معماری
         super().__init__()
-        self.model = resnet50(pretrained=False)
-        self.model.fc = torch.nn.Linear(self.model.fc.in_features, 1)  # Binary output
+        if arch == 'resnet20':
+            self.model = ResNet20() # همان کلاسی که قبلا ساختیم
+        else:
+            self.model = resnet50(pretrained=False)
+            self.model.fc = torch.nn.Linear(self.model.fc.in_features, 1)
 
     def forward(self, x):
         return self.model(x)
@@ -20,7 +23,7 @@ class DeepfakeEnsemble:
         self.models = []
         
         for i, path in enumerate(model_paths):
-            model = ResNetKD().to(device)
+            model = ResNetKD(arch='resnet20').to(device) # حالا درست لود می‌شود
             ckpt = torch.load(path, map_location=device)
             
             if isinstance(ckpt, dict):
