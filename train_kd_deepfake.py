@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet50
 from tqdm import tqdm
 import os
 import pandas as pd
@@ -10,7 +9,9 @@ import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 from sklearn.model_selection import train_test_split
-from torch.cuda.amp import GradScaler, autocast
+# در ابتدای فایل
+from torch.amp import GradScaler, autocast
+from torchvision.models import resnet50, ResNet50_Weights
 
 class FaceDataset(Dataset):
     def __init__(self, data_frame, root_dir, transform=None, img_column='images_id'):
@@ -219,7 +220,9 @@ class ResNetTeacher(nn.Module):
     """معلم: ResNet-50"""
     def __init__(self):
         super().__init__()
-        self.model = resnet50(pretrained=False)
+        # در کلاس ResNetTeacher
+
+        self.model = resnet50(weights=None) # یا ResNet50_Weights.DEFAULT اگر می‌خواهید وزن‌های پیش‌فرض داشته باشد
         self.model.fc = nn.Linear(self.model.fc.in_features, 1)
         
         self.features = []
@@ -360,8 +363,10 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
             images = images.to(device)
             labels = labels.to(device).float().unsqueeze(1)
 
-            # استفاده از Mixed Precision در زمان Forward
-            with autocast():
+            scaler = GradScaler('cuda') # مشخص کردن دستگاه
+
+# در حلقه آموزش (داخل باک autocast)
+            with autocast('cuda'): 
                 with torch.no_grad():
                     teacher_logits, teacher_feats = teacher(images)
                 
