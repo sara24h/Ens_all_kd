@@ -148,12 +148,12 @@ class Dataset_selector:
         print(f"Test label distribution:\n{test_data['label'].value_counts()}")
 
         # Check missing images
-        for split_name, data in [('train', train_data), ('val', val_data), ('test', test_data)]:
+        #for split_name, data in [('train', train_data), ('val', val_data), ('test', test_data)]:
     # استفاده از img_column به جای images_id
-            missing = [os.path.join(root_dir, p) for p in data[img_column] if not os.path.exists(os.path.join(root_dir, p))]
-            print(f"{split_name} missing images: {len(missing)}")
-            if missing:
-                print(f"Sample missing: {missing[:3]}")
+         #   missing = [os.path.join(root_dir, p) for p in data[img_column] if not os.path.exists(os.path.join(root_dir, p))]
+          #  print(f"{split_name} missing images: {len(missing)}")
+           # if missing:
+            #    print(f"Sample missing: {missing[:3]}")
 
         # Create datasets
         train_dataset = FaceDataset(train_data, root_dir, transform=transform_train, img_column=img_column)
