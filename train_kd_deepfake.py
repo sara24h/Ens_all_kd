@@ -125,9 +125,26 @@ def logits_loss(teacher_logits, student_logits):
 def at_loss(teacher_features, student_features):
     loss = 0.0
     for t_feat, s_feat in zip(teacher_features, student_features):
-        t_att = F.normalize(t_feat.pow(2).mean(1).view(t_feat.size(0), -1), dim=1)
-        s_att = F.normalize(s_feat.pow(2).mean(1).view(s_feat.size(0), -1), dim=1)
+        # محاسبه Attention Map مطابق فرمول مقاله: میانگین مربعات در بعد کانال
+        # خروجی به شکل (Batch, H, W) خواهد بود
+        t_att = t_feat.pow(2).mean(1) 
+        s_att = s_feat.pow(2).mean(1)
+        
+        # اگر ابعاد مکانی (H, W) معلم و دانش‌آموز متفاوت بود، ابعاد دانش‌آموز را به معلم نزدیک میکنیم
+        if t_att.shape != s_att.shape:
+            s_att = F.interpolate(s_att.unsqueeze(1), size=t_att.shape[1:], mode='bilinear', align_corners=False).squeeze(1)
+        
+        # فلتن کردن برای تبدیل به وکتور و محاسبه نرم
+        t_att = t_att.view(t_att.size(0), -1)
+        s_att = s_att.view(s_att.size(0), -1)
+        
+        # نرمال سازی با L2 Norm مطابق فرمول مقاله
+        t_att = F.normalize(t_att, dim=1)
+        s_att = F.normalize(s_att, dim=1)
+        
+        # محاسبه MSE
         loss += F.mse_loss(s_att, t_att) # فرمول شماره 4
+        
     return loss
 
 class RKDLoss(nn.Module):
@@ -154,6 +171,7 @@ class ResNetTeacher(nn.Module):
         self.model.fc = nn.Linear(self.model.fc.in_features, 1)
         self.features = []
         def hook_fn(module, input, output): self.features.append(output)
+        # هوک روی لایه های 2، 3 و 4
         self.model.layer2[-1].register_forward_hook(hook_fn)
         self.model.layer3[-1].register_forward_hook(hook_fn)
         self.model.layer4[-1].register_forward_hook(hook_fn)
@@ -192,9 +210,10 @@ class ResNetStudent(nn.Module):
         self.model = ResNet20()
         self.features = []
         def hook_fn(module, input, output): self.features.append(output)
-        self.model.layer1.register_forward_hook(hook_fn)
+        # اصلاح مهم: هوک باید روی لایه 2 و 3 باشد تا با معلم متناسب باشد
         self.model.layer2.register_forward_hook(hook_fn)
         self.model.layer3.register_forward_hook(hook_fn)
+        # چون ResNet20 لایه 4 ندارد، از همین دو لایه استفاده میکنیم
     def forward(self, x):
         self.features.clear(); return self.model(x), self.features
 
@@ -270,8 +289,10 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                 
                 if kd_method == 'logits': 
                     loss = base_loss + logits_loss(teacher_logits, student_logits)
+                    
                 elif kd_method == 'at': 
-                    loss = base_loss + at_loss(teacher_feats, student_feats)
+                    loss = base_loss + at_loss(teacher_feats[:2], student_feats)
+                    
                 elif kd_method == 'rkd':
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
                     s_emb = student.module.model.avgpool(student_feats[-1]).flatten(1)
