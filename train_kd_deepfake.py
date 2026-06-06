@@ -7,7 +7,6 @@ import pandas as pd
 from PIL import Image
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
 from torch.amp import GradScaler, autocast
 from torchvision.models import resnet50, ResNet50_Weights
 
@@ -62,6 +61,8 @@ class Dataset_selector:
             raise ValueError("dataset_mode must be  '140k', '190k', '200k'")
         self.dataset_mode = dataset_mode
 
+        # مطابق مقاله: سایز تصاویر CIFAR برابر 32x32 با Padding 4 است
+        # اما چون دیتاست شما Deepfake است (256x256)، از همان 256 استفاده می‌کنیم
         image_size = (256, 256) if dataset_mode in ['140k', '190k', '200k'] else (300, 300)
 
         if dataset_mode == '140k':
@@ -71,6 +72,7 @@ class Dataset_selector:
         elif dataset_mode == '190k':
             mean, std = (0.4668, 0.3816, 0.3414), (0.2410, 0.2161, 0.2081)
 
+        # مطابق بخش 3.1 مقاله: Augmentation شامل نرمالسازی، کراپ/فلیپ رندوم است
         transform_train = transforms.Compose([
             transforms.Resize(image_size),
             transforms.RandomHorizontalFlip(p=0.5),
@@ -79,6 +81,8 @@ class Dataset_selector:
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
+        
+        # مطابق مقاله: Validation set is only normalized
         transform_test = transforms.Compose([
             transforms.Resize(image_size),
             transforms.ToTensor(),
@@ -270,7 +274,7 @@ class ResNetStudent(nn.Module):
 
 # ====================== Training Function ======================
 def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
-                  epochs=30, lr=0.005, batch_size=64):
+                  epochs=30, lr=0.1, momentum=0.9, weight_decay=0.0005, batch_size=64):
     
     torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
@@ -286,8 +290,17 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     student = ResNetStudent().to(device)
     student = DDP(student, device_ids=[local_rank])
 
-    optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    # مطابق مقاله: SGD with Nesterov acceleration, momentum of 0.9, Weight decay 0.0005
+    optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=momentum, 
+                                weight_decay=weight_decay, nesterov=True)
+    
+    # مطابق مقاله: The learning rate is divided by 10 at 50% and 75% of the total epochs
+    milestone_1 = int(epochs * 0.50)
+    milestone_2 = int(epochs * 0.75)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, 
+                                                    milestones=[milestone_1, milestone_2], 
+                                                    gamma=0.1)
+                                                    
     criterion = nn.BCEWithLogitsLoss()
     scaler = GradScaler('cuda')
     
@@ -315,6 +328,9 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     train_loader = ds.loader_train
     train_sampler = ds.train_sampler
 
+    if local_rank == 0:
+        print(f"\n[Scheduler Info] LR will drop by 0.1x at epochs: {milestone_1} and {milestone_2}")
+
     for epoch in range(epochs):
         student.train()
         
@@ -322,10 +338,8 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
             train_sampler.set_epoch(epoch)
             
         running_loss = 0.0
-        # --- متغیرهای جدید برای محاسبه دقت ---
         running_corrects = 0
         total_samples = 0
-        # ----------------------------------------
         
         data_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}") if local_rank == 0 else train_loader
         
@@ -362,32 +376,31 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
             
             running_loss += loss.item()
             
-            # --- محاسبه دقت برای بچ جاری ---
             with torch.no_grad():
                 probs = torch.sigmoid(student_logits)
                 preds = (probs > 0.5).float()
                 corrects = (preds == labels).sum().item()
                 running_corrects += corrects
                 total_samples += labels.size(0)
-            # --------------------------------------
 
-            # --- آپدیت نمودار پیشرفت (فقط در GPU اصلی) ---
             if local_rank == 0:
                 current_loss = running_loss / (i + 1)
                 current_acc = (running_corrects / total_samples) * 100
+                # نمایش نرخ یادگیری فعلی در نمودار پیشرفت
+                current_lr = optimizer.param_groups[0]['lr']
                 data_iter.set_postfix({
                     'Loss': f'{current_loss:.4f}', 
-                    'Acc': f'{current_acc:.2f}%'
+                    'Acc': f'{current_acc:.2f}%',
+                    'LR': f'{current_lr:.5f}'
                 })
-            # ------------------------------------------------
 
         scheduler.step()
         
         if local_rank == 0:
-            # چاپ نهایی ایپاک با دقت کل ایپاک
             epoch_loss = running_loss / len(train_loader)
             epoch_acc = (running_corrects / total_samples) * 100
-            print(f"Epoch {epoch+1}/{epochs} | Loss: {epoch_loss:.4f} | Accuracy: {epoch_acc:.2f}%")
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch+1}/{epochs} | Loss: {epoch_loss:.4f} | Accuracy: {epoch_acc:.2f}% | LR: {current_lr:.6f}")
 
     if local_rank == 0:
         torch.save(student.module.state_dict(), f"student_{dataset_mode}_{kd_method}_amp_ddp.pth")
@@ -401,7 +414,13 @@ if __name__ == "__main__":
     parser.add_argument('--mode', type=str, required=True, help="140k, 190k, or 200k")
     parser.add_argument('--method', type=str, required=True, help="logits, at, or rkd")
     parser.add_argument('--path', type=str, required=True, help="Path to teacher pth")
-    parser.add_argument('--epochs', type=int, default=30, help="Number of training epochs")
+    parser.add_argument('--epochs', type=int, default=200, help="Number of training epochs")
+    
+    # <<<<<<<<<< هایپرپارامترهای جدید اضافه شده >>>>>>>>>>
+    parser.add_argument('--lr', type=float, default=0.1, help="Initial learning rate")
+    parser.add_argument('--momentum', type=float, default=0.9, help="SGD momentum")
+    parser.add_argument('--weight_decay', type=float, default=0.0005, help="Weight decay")
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
     
     args = parser.parse_args()
     
@@ -413,7 +432,10 @@ if __name__ == "__main__":
         teacher_path=args.path, 
         dataset_mode=args.mode, 
         kd_method=args.method,
-        epochs=args.epochs
+        epochs=args.epochs,
+        lr=args.lr,                 # پاس دادن به تابع
+        momentum=args.momentum,     # پاس دادن به تابع
+        weight_decay=args.weight_decay # پاس دادن به تابع
     )
     
     dist.destroy_process_group()
