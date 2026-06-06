@@ -355,6 +355,7 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
                       
     train_loader = ds.loader_train
 
+    scaler = GradScaler('cuda')                  
     for epoch in range(epochs):
         student.train()
         running_loss = 0.0
@@ -363,9 +364,7 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
             images = images.to(device)
             labels = labels.to(device).float().unsqueeze(1)
 
-            scaler = GradScaler('cuda') # مشخص کردن دستگاه
 
-# در حلقه آموزش (داخل باک autocast)
             with autocast('cuda'): 
                 with torch.no_grad():
                     teacher_logits, teacher_feats = teacher(images)
