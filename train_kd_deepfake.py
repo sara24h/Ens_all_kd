@@ -337,7 +337,7 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     elif dataset_mode == '190k':
         ds = Dataset_selector(dataset_mode='190k', realfake190k_root_dir='/kaggle/input/datasets/manjilkarki/deepfake-and-real-images/Dataset', train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
     elif dataset_mode == '200k':
-        ds = Dataset_selector(dataset_mode='200k', realfake200k_val_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/val_labels.csv', realfake200k_test_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/test_labels.csv', realfake200k_train_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/train_labels.csv', realfake200k_root_dir='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset', train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
+        ds = Dataset_selector(dataset_mode='200k', realfake200k_val_csv='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset/val_labels.csv', realfake200k_test_csv='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset/test_labels.csv', realfake200k_train_csv='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset/train_labels.csv', realfake200k_root_dir='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset', train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
                               
     train_loader, train_sampler = ds.loader_train, ds.train_sampler
 
