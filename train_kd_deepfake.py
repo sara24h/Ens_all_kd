@@ -1,43 +1,18 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet50
+from torchvision.models import resnet50, resnet20   # ← اضافه شد
 from tqdm import tqdm
 import os
 import pandas as pd
 from PIL import Image
-from sklearn.model_selection import train_test_split
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
 
 # ====================== Dataset Classes ======================
-class FaceDataset(Dataset):
-    def __init__(self, data_frame, root_dir, transform=None, img_column='images_id'):
-        self.data = data_frame
-        self.root_dir = root_dir
-        self.transform = transform
-        self.img_column = img_column
-        self.label_map = {1: 1, 0: 0, 'real': 1, 'fake': 0, 'Real': 1, 'Fake': 0}
+# (FaceDataset و Dataset_selector را کامل کپی کنید)
 
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        img_name = os.path.join(self.root_dir, self.data[self.img_column].iloc[idx])
-        if not os.path.exists(img_name):
-            raise FileNotFoundError(f"image not found: {img_name}")
-        image = Image.open(img_name).convert('RGB')
-        label = self.label_map[self.data['label'].iloc[idx]]
-        if self.transform:
-            image = self.transform(image)
-        return image, torch.tensor(label, dtype=torch.float)
-
-class Dataset_selector:
-    # ... (تمام کد Dataset_selector که نوشتی را دقیقاً اینجا کپی کن)
-    # (برای صرفه‌جویی در فضا، همان کد قبلی‌ات را نگه دار)
-    pass  # ← اینجا کد کامل Dataset_selector را بچسبان
-
-# ====================== KD Components ======================
+# ====================== KD Losses ======================
 def logits_loss(teacher_logits, student_logits, T=4.0):
     teacher_prob = torch.sigmoid(teacher_logits / T)
     student_prob = torch.sigmoid(student_logits / T)
@@ -76,7 +51,9 @@ class RKDLoss(nn.Module):
         cosine = torch.mm(x, x.t())
         return torch.acos(torch.clamp(cosine, -1.0 + 1e-7, 1.0 - 1e-7))
 
-class ResNetKD(nn.Module):
+# ====================== Models ======================
+class ResNetTeacher(nn.Module):
+    """معلم: ResNet-50"""
     def __init__(self):
         super().__init__()
         self.model = resnet50(pretrained=False)
@@ -85,7 +62,6 @@ class ResNetKD(nn.Module):
         self.features = []
         def hook_fn(module, input, output):
             self.features.append(output)
-        
         self.model.layer2[-1].register_forward_hook(hook_fn)
         self.model.layer3[-1].register_forward_hook(hook_fn)
         self.model.layer4[-1].register_forward_hook(hook_fn)
@@ -95,20 +71,88 @@ class ResNetKD(nn.Module):
         logit = self.model(x)
         return logit, self.features
 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# کلاس پایه برای ResNet-20 (مخصوص کارهای KD و سبک‌سازی)
+def conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+class BasicBlock(nn.Module):
+    def __init__(self, inplanes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = None
+        if stride != 1 or inplanes != planes:
+            self.downsample = nn.Sequential(nn.Conv2d(inplanes, planes, kernel_size=1, stride=stride, bias=False), nn.BatchNorm2d(planes))
+
+    def forward(self, x):
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out += identity
+        return self.relu(out)
+
+class ResNet20(nn.Module):
+    def __init__(self):
+        super(ResNet20, self).__init__()
+        self.inplanes = 16
+        self.conv1 = conv3x3(3, 16)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.relu = nn.ReLU(inplace=True)
+        self.layer1 = nn.Sequential(BasicBlock(16, 16), BasicBlock(16, 16), BasicBlock(16, 16))
+        self.layer2 = nn.Sequential(BasicBlock(16, 32, 2), BasicBlock(32, 32), BasicBlock(32, 32))
+        self.layer3 = nn.Sequential(BasicBlock(32, 64, 2), BasicBlock(64, 64), BasicBlock(64, 64))
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(64, 1)
+
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.layer1(x)
+        feat2 = self.layer2(x) # Hook point
+        feat3 = self.layer3(feat2) # Hook point
+        x = self.avgpool(feat3)
+        return self.fc(x.view(x.size(0), -1))
+
+
+class ResNetStudent(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = ResNet20() # استفاده از مدل بالا
+        
+        # ثبت هوک‌ها
+        self.features = []
+        def hook_fn(module, input, output):
+            self.features.append(output)
+
+        # در کلاس ResNetStudent:
+        self.model.layer1.register_forward_hook(hook_fn) 
+        self.model.layer2.register_forward_hook(hook_fn)
+        self.model.layer3.register_forward_hook(hook_fn)
+
+    def forward(self, x):
+        self.features.clear()
+        logit = self.model(x)
+        return logit, self.features
+
 # ====================== Training Function ======================
 def train_student(teacher_path, dataset_mode, kd_method='logits',
-                  epochs=25, lr=0.005, device='cuda', batch_size=48):
+                  epochs=30, lr=0.005, device='cuda', batch_size=64):
     
-    teacher = ResNetKD().to(device)
+    # Teacher (ResNet-50)
+    teacher = ResNetTeacher().to(device)
     ckpt = torch.load(teacher_path, map_location=device)
-    
     if isinstance(ckpt, dict):
-        if 'state_dict' in ckpt:
-            teacher.model.load_state_dict(ckpt['state_dict'], strict=False)
-        elif 'model' in ckpt:
-            teacher.model.load_state_dict(ckpt['model'], strict=False)
-        else:
-            teacher.model.load_state_dict(ckpt, strict=False)
+        state = ckpt.get('state_dict') or ckpt.get('model') or ckpt
+        teacher.model.load_state_dict(state, strict=False)
     else:
         teacher.model.load_state_dict(ckpt, strict=False)
     
@@ -116,13 +160,13 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
     for p in teacher.parameters():
         p.requires_grad = False
 
-    student = ResNetKD().to(device)
+    # Student (ResNet-20)
+    student = ResNetStudent().to(device)
     optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    
     criterion = nn.BCEWithLogitsLoss()
 
-    # ایجاد دیتاست
+    # Dataset (توصیه: همه روی 200k)
     if dataset_mode == '140k':
         ds = Dataset_selector(dataset_mode='140k', 
                               realfake140k_train_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/train.csv', # مسیرها را پر کن
@@ -141,13 +185,12 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
                               realfake200k_root_dir='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset',
                               realfake190k_root_dir='/kaggle/input/datasets/manjilkarki/deepfake-and-real-images/Dataset',
                               train_batch_size=batch_size, eval_batch_size=64, ddp=False)
-
+                      
     train_loader = ds.loader_train
 
     for epoch in range(epochs):
         student.train()
         running_loss = 0.0
-        
         for images, labels in tqdm(train_loader):
             images = images.to(device)
             labels = labels.to(device).float().unsqueeze(1)
@@ -156,6 +199,12 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
                 teacher_logits, teacher_feats = teacher(images)
             
             student_logits, student_feats = student(images)
+
+            if epoch == 0 and i == 0:
+                print(f"\n--- Debugging Feature Dimensions ---")
+                print(f"Teacher feats shapes: {[f.shape for f in teacher_feats]}")
+                print(f"Student feats shapes: {[f.shape for f in student_feats]}")
+                print(f"-------------------------------------\n")
             
             base_loss = criterion(student_logits, labels)
             
@@ -166,8 +215,8 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
                 kd_loss = at_loss(teacher_feats, student_feats)
                 loss = base_loss + 0.4 * kd_loss
             elif kd_method == 'rkd':
-                t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
-                s_emb = student.model.avgpool(student_feats[-1]).flatten(1)
+                t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1) if hasattr(teacher.model, 'avgpool') else teacher_feats[-1].mean([2,3]).flatten(1)
+                s_emb = student.model.avgpool(student_feats[-1]).flatten(1) if hasattr(student.model, 'avgpool') else student_feats[-1].mean([2,3]).flatten(1)
                 rkd_loss = RKDLoss().to(device)(t_emb, s_emb)
                 loss = base_loss + 0.5 * rkd_loss
 
@@ -179,8 +228,8 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
         scheduler.step()
         print(f"Epoch {epoch+1}/{epochs} | Loss: {running_loss/len(train_loader):.4f}")
 
-    torch.save(student.state_dict(), f"student_{dataset_mode}_{kd_method}.pth")
-    print(f"Student saved → student_{dataset_mode}_{kd_method}.pth")
+    torch.save(student.state_dict(), f"baseline_student_{dataset_mode}_{kd_method}.pth")
+    print(f"Saved: baseline_student_{dataset_mode}_{kd_method}.pth")
 
 # ====================== اجرا ======================
 if __name__ == "__main__":
