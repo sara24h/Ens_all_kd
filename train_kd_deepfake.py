@@ -132,32 +132,28 @@ class Dataset_selector:
             val_data = collect_images_from_folder('Validation').sample(frac=1, random_state=None).reset_index(drop=True)
             test_data = collect_images_from_folder('Test').sample(frac=1, random_state=None).reset_index(drop=True)
 
-        # Create datasets
         train_dataset = FaceDataset(train_data, root_dir, transform=transform_train, img_column=img_column)
         val_dataset = FaceDataset(val_data, root_dir, transform=transform_test, img_column=img_column)
         test_dataset = FaceDataset(test_data, root_dir, transform=transform_test, img_column=img_column)
 
-        # ---- تنظیمات DDP برای DataLoader ----
         self.train_sampler = None
         shuffle_train = True
         
         if ddp:
             self.train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-            shuffle_train = False # وقتی sampler داریم، shuffle در DataLoader باید False باشد
+            shuffle_train = False
 
         self.loader_train = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=shuffle_train, 
                                        num_workers=num_workers, pin_memory=pin_memory, sampler=self.train_sampler)
         self.loader_val = DataLoader(val_dataset, batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
         self.loader_test = DataLoader(test_dataset, batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
-        if rank == 0: # فقط در GPU اصلی لاگ بزن
+        if rank == 0: 
             print(f"DataLoaders ready - Train batches: {len(self.loader_train)}, Val: {len(self.loader_val)}, Test: {len(self.loader_test)}")
 
 # ====================== KD Losses ======================
-def logits_loss(teacher_logits, student_logits, T=4.0):
-    teacher_prob = torch.sigmoid(teacher_logits / T)
-    student_prob = torch.sigmoid(student_logits / T)
-    return F.kl_div(torch.log(student_prob + 1e-8), teacher_prob, reduction='batchmean') * (T ** 2)
+def logits_loss(teacher_logits, student_logits):
+    return F.mse_loss(teacher_logits, student_logits)
 
 def at_loss(teacher_features, student_features):
     loss = 0.0
@@ -273,15 +269,12 @@ class ResNetStudent(nn.Module):
         return logit, self.features
 
 # ====================== Training Function ======================
-# ====================== Training Function ======================
 def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                   epochs=30, lr=0.005, batch_size=64):
     
-    # 1. تنظیمات اولیه DDP
     torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
     
-    # 2. آماده سازی معلم (بدون DDP)
     teacher = ResNetTeacher().to(device)
     ckpt = torch.load(teacher_path, map_location=device)
     state = ckpt.get('state_dict') or ckpt.get('model') or ckpt
@@ -290,10 +283,7 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     for p in teacher.parameters():
         p.requires_grad = False
 
-    # 3. آماده سازی دانش‌آموز
     student = ResNetStudent().to(device)
-    
-    # 4. پیچیدن فقط دانش‌آموز در DDP
     student = DDP(student, device_ids=[local_rank])
 
     optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
@@ -303,7 +293,6 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     
     rkd_criterion = RKDLoss().to(device) if kd_method == 'rkd' else None
 
-    # 5. لود دادهها با فعال بودن DDP
     if dataset_mode == '140k':
         ds = Dataset_selector(dataset_mode='140k', 
                               realfake140k_train_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/train.csv',
@@ -333,6 +322,10 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
             train_sampler.set_epoch(epoch)
             
         running_loss = 0.0
+        # --- متغیرهای جدید برای محاسبه دقت ---
+        running_corrects = 0
+        total_samples = 0
+        # ----------------------------------------
         
         data_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}") if local_rank == 0 else train_loader
         
@@ -343,27 +336,24 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
             with autocast('cuda'): 
                 with torch.no_grad():
                     teacher_logits, _ = teacher(images)
-                    # دسترسی مستقیم به فیچرهای هوک شده (چون معلم DDP نیست)
                     teacher_feats = teacher.features  
                 
                 student_logits, _ = student(images)
-                # دسترسی به فیچرهای هوک شده از طریق .module (چون دانش‌آموز DDP است)
                 student_feats = student.module.features 
                 
                 base_loss = criterion(student_logits, labels)
                 
                 if kd_method == 'logits':
-                    kd_loss = logits_loss(teacher_logits, student_logits, T=4.0)
-                    loss = 0.6 * base_loss + 0.4 * kd_loss
+                    kd_loss = logits_loss(teacher_logits, student_logits)
+                    loss = base_loss + kd_loss
                 elif kd_method == 'at':
                     kd_loss = at_loss(teacher_feats, student_feats)
-                    loss = base_loss + 0.4 * kd_loss
+                    loss = base_loss + kd_loss
                 elif kd_method == 'rkd':
-                    # دسترسی مستقیم به avgpool در معلم و دسترسی از طریق module در دانش‌آموز
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
                     s_emb = student.module.model.avgpool(student_feats[-1]).flatten(1)
                     rkd_loss_val = rkd_criterion(t_emb, s_emb)
-                    loss = base_loss + 0.5 * rkd_loss_val
+                    loss = base_loss + rkd_loss_val
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -371,14 +361,35 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
             scaler.update()
             
             running_loss += loss.item()
+            
+            # --- محاسبه دقت برای بچ جاری ---
+            with torch.no_grad():
+                probs = torch.sigmoid(student_logits)
+                preds = (probs > 0.5).float()
+                corrects = (preds == labels).sum().item()
+                running_corrects += corrects
+                total_samples += labels.size(0)
+            # --------------------------------------
+
+            # --- آپدیت نمودار پیشرفت (فقط در GPU اصلی) ---
+            if local_rank == 0:
+                current_loss = running_loss / (i + 1)
+                current_acc = (running_corrects / total_samples) * 100
+                data_iter.set_postfix({
+                    'Loss': f'{current_loss:.4f}', 
+                    'Acc': f'{current_acc:.2f}%'
+                })
+            # ------------------------------------------------
 
         scheduler.step()
         
         if local_rank == 0:
-            print(f"Epoch {epoch+1}/{epochs} | Loss: {running_loss/len(train_loader):.4f}")
+            # چاپ نهایی ایپاک با دقت کل ایپاک
+            epoch_loss = running_loss / len(train_loader)
+            epoch_acc = (running_corrects / total_samples) * 100
+            print(f"Epoch {epoch+1}/{epochs} | Loss: {epoch_loss:.4f} | Accuracy: {epoch_acc:.2f}%")
 
     if local_rank == 0:
-        # ذخیره state_dict از داخل student.module
         torch.save(student.module.state_dict(), f"student_{dataset_mode}_{kd_method}_amp_ddp.pth")
         print(f"Model saved successfully by Rank 0.")
 
@@ -390,20 +401,19 @@ if __name__ == "__main__":
     parser.add_argument('--mode', type=str, required=True, help="140k, 190k, or 200k")
     parser.add_argument('--method', type=str, required=True, help="logits, at, or rkd")
     parser.add_argument('--path', type=str, required=True, help="Path to teacher pth")
+    parser.add_argument('--epochs', type=int, default=30, help="Number of training epochs")
     
     args = parser.parse_args()
     
     dist.init_process_group(backend="gloo")
-    
-    # گرفتن شماره GPU مربوط به این پردازش específico
     local_rank = int(os.environ["LOCAL_RANK"])
     
     train_student(
         local_rank=local_rank,
         teacher_path=args.path, 
         dataset_mode=args.mode, 
-        kd_method=args.method
+        kd_method=args.method,
+        epochs=args.epochs
     )
     
-    # پاکسازی منابع DDP
     dist.destroy_process_group()
