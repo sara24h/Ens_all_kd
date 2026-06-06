@@ -283,25 +283,16 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     # ==========================================
     # 5. محاسبه دقت تست و سیو مدل (فقط در GPU اصلی)
     # ==========================================
-        # ==========================================
-    # 5. محاسبه دقت تست و سیو مدل (فقط در GPU اصلی)
-    # ==========================================
     if local_rank == 0:
         print("\n" + "="*50)
         print("Evaluating on Test Set...")
-        
-        # بسیار مهم: خروج مدل از حالت DDP برای جلوگیری از انتظار برای GPU های دیگر
-        raw_student_model = student.module 
-        raw_student_model.eval() 
-        
+        student.eval()
         test_corrects, test_total = 0, 0
         
         with torch.no_grad():
             for images, labels in tqdm(ds.loader_test, desc="Testing"):
                 images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
-                
-                # استفاده از مدل خام به جای student (که DDP است)
-                logits, _ = raw_student_model(images)
+                logits, _ = student(images)
                 preds = (torch.sigmoid(logits) > 0.5).float()
                 test_corrects += (preds == labels).sum().item()
                 test_total += labels.size(0)
@@ -310,8 +301,7 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
         print(f"==> Final Test Accuracy (Single Student): {test_acc:.2f}%")
         print("="*50 + "\n")
 
-        # ذخیره state_dict مدل خام
-        torch.save(raw_student_model.state_dict(), f"student_{dataset_mode}_{kd_method}_amp_ddp.pth")
+        torch.save(student.module.state_dict(), f"student_{dataset_mode}_{kd_method}_amp_ddp.pth")
         print(f"Model saved successfully.")
 
 # ==========================================
