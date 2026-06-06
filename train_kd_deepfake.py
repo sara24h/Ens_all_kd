@@ -8,14 +8,7 @@ import pandas as pd
 from PIL import Image
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
-
-# ====================== Dataset Classes ======================
-import torch
-from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
-import os
-import pandas as pd
-from PIL import Image
 from sklearn.model_selection import train_test_split
 
 class FaceDataset(Dataset):
@@ -59,7 +52,7 @@ class Dataset_selector:
         ddp=False,
     ):
         if dataset_mode not in ['140k', '190k', '200k']:
-            raise ValueError("dataset_mode must be 'hardfake', 'rvf10k', '140k', '190k', '200k', or '330k'")
+            raise ValueError("dataset_mode must be  '140k', '190k', '200k'")
         self.dataset_mode = dataset_mode
 
         image_size = (256, 256) if dataset_mode in ['140k', '190k', '200k'] else (300, 300)
@@ -190,26 +183,14 @@ class Dataset_selector:
             print(f"Error in train loader: {e}")
 
 if __name__ == "__main__":
-  
-
-    # Example for rvf10k
-    dataset_rvf10k = Dataset_selector(
-        dataset_mode='rvf10k',
-        rvf10k_train_csv='/kaggle/input/rvf10k/train.csv',
-        rvf10k_valid_csv='/kaggle/input/rvf10k/valid.csv',
-        rvf10k_root_dir='/kaggle/input/rvf10k',
-        train_batch_size=64,
-        eval_batch_size=64,
-        ddp=True,
-    )
 
     # Example for 140k Real and Fake Faces
     dataset_140k = Dataset_selector(
         dataset_mode='140k',
-        realfake140k_train_csv='/kaggle/input/140k-real-and-fake-faces/train.csv',
-        realfake140k_valid_csv='/kaggle/input/140k-real-and-fake-faces/valid.csv',
-        realfake140k_test_csv='/kaggle/input/140k-real-and-fake-faces/test.csv',
-        realfake140k_root_dir='/kaggle/input/140k-real-and-fake-faces',
+        realfake140k_train_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/train.csv',
+        realfake140k_valid_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/valid.csv',
+        realfake140k_test_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/test.csv',
+        realfake140k_root_dir='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces',
         train_batch_size=64,
         eval_batch_size=64,
         ddp=True,
@@ -218,7 +199,7 @@ if __name__ == "__main__":
     # Example for 190k Real and Fake Faces
     dataset_190k = Dataset_selector(
         dataset_mode='190k',
-        realfake190k_root_dir='/kaggle/input/deepfake-and-real-images/Dataset',
+        realfake190k_root_dir='/kaggle/input/datasets/manjilkarki/deepfake-and-real-images/Dataset',
         train_batch_size=64,
         eval_batch_size=64,
         ddp=True,
@@ -236,14 +217,6 @@ if __name__ == "__main__":
         ddp=True,
     )
 
-    # Example for 330k Real and Fake Faces
-    dataset_330k = Dataset_selector(
-        dataset_mode='330k',
-        realfake330k_root_dir='/kaggle/input/deepfake-dataset',
-        train_batch_size=64,
-        eval_batch_size=64,
-        ddp=True,
-    )
 
 # ====================== KD Losses ======================
 def logits_loss(teacher_logits, student_logits, T=4.0):
