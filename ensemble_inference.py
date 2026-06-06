@@ -96,11 +96,14 @@ class DeepfakeEnsemble:
         dist.all_gather_object(gathered_labels, local_labels)
 
         # محاسبه معیارها فقط در GPU اصلی (برای جلوگیری از تکرار)
+                # محاسبه معیارها فقط در GPU اصلی (برای جلوگیری از تکرار)
         if dist.get_rank() == 0:
             # ترکیب کردن آرایه‌های برگشتی از هر دو GPU
             final_probs = np.concatenate(gathered_probs)
-            final_preds = np.concatenate(gathered_preds)
             final_labels = np.concatenate(gathered_labels)
+            
+            # اصلاح باگ: ساختن پیش‌بینی‌ها مستقیماً از روی احتمالات نهایی
+            final_preds = (final_probs > 0.5).astype(float)
             
             acc = accuracy_score(final_labels, final_preds)
             auc = roc_auc_score(final_labels, final_probs)
