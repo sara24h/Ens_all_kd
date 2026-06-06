@@ -257,7 +257,7 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                 base_loss = criterion(student_logits, labels)
                 
                 if kd_method == 'logits': loss = base_loss + logits_loss(teacher_logits, student_logits)
-                elif kd_method == 'at': loss = base_loss + at_loss(teacher_feats, student_feats.module.features)
+                elif kd_method == 'at': loss = base_loss + at_loss(teacher_feats, student_feats)
                 elif kd_method == 'rkd':
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
                     s_emb = student_feats[-1] if not isinstance(student_feats, list) else student.module.model.avgpool(student_feats[-1]).flatten(1)
@@ -281,24 +281,45 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
         if local_rank == 0: print(f"Epoch {epoch+1}/{epochs} | Loss: {running_loss/len(train_loader):.4f} | Train Acc: {(running_corrects/total_samples)*100:.2f}%")
 
     # ==========================================
-    # 5. محاسبه دقت تست و سیو مدل (فقط در GPU اصلی)
+    # 5. محاسبه دقت تست (اصلاح شده برای DDP)
     # ==========================================
-    if local_rank == 0:
-        print("\n" + "="*50)
-        print("Evaluating on Test Set...")
-        student.eval()
-        test_corrects, test_total = 0, 0
+    student.eval()
+    test_corrects = 0
+    test_total = 0
+    
+    # حتما باید از autocast در تست هم استفاده کنید تا خروجی با آموزش یکی باشد
+    with torch.no_grad():
+        # نوار پیشرفت فقط برای رنک 0 نشان داده می‌شود
+        test_iter = tqdm(ds.loader_test, desc="Evaluating Test Set") if local_rank == 0 else ds.loader_test
         
-        with torch.no_grad():
-            for images, labels in tqdm(ds.loader_test, desc="Testing"):
-                images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
+        for images, labels in test_iter:
+            images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
+            
+            with autocast('cuda'):
                 logits, _ = student(images)
                 preds = (torch.sigmoid(logits) > 0.5).float()
-                test_corrects += (preds == labels).sum().item()
-                test_total += labels.size(0)
                 
+            test_corrects += (preds == labels).sum().item()
+            test_total += labels.size(0)
+
+    # بسیار مهم: جمع کردن دقت تمام GPUها
+    if dist.is_initialized():
+        # تبدیل به تنسور روی GPU
+        tensor_corrects = torch.tensor(test_corrects, dtype=torch.float64, device=device)
+        tensor_total = torch.tensor(test_total, dtype=torch.float64, device=device)
+        
+        # جمع کردن مقادیر از تمام پردازنده‌ها
+        dist.all_reduce(tensor_corrects, op=dist.ReduceOp.SUM)
+        dist.all_reduce(tensor_total, op=dist.ReduceOp.SUM)
+        
+        test_corrects = tensor_corrects.item()
+        test_total = tensor_total.item()
+
+    # چاپ نتیجه نهایی و سیو مدل (فقط توسط GPU اصلی انجام شود تا تکرار نشود)
+    if local_rank == 0:
         test_acc = (test_corrects / test_total) * 100
-        print(f"==> Final Test Accuracy (Single Student): {test_acc:.2f}%")
+        print("\n" + "="*50)
+        print(f"==> Final Test Accuracy: {test_acc:.2f}%")
         print("="*50 + "\n")
 
         torch.save(student.module.state_dict(), f"student_{dataset_mode}_{kd_method}_amp_ddp.pth")
@@ -319,7 +340,9 @@ if __name__ == "__main__":
     parser.add_argument('--weight_decay', type=float, default=0.0005, help="Weight decay")
     args = parser.parse_args()
     
-    dist.init_process_group(backend="gloo")
+    # نکته: برای سرعت بالاتر در دیتاست‌های تصویری بهتر است از nccl استفاده کنید نه gloo
+    # اما اگر در ویندوز هستید یا خطا داد، همان gloo بماند.
+    dist.init_process_group(backend="gloo") 
     local_rank = int(os.environ["LOCAL_RANK"])
     
     train_student(
