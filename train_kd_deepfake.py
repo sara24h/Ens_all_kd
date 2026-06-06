@@ -451,7 +451,7 @@ if __name__ == "__main__":
     parser.add_argument('--beta', type=float, default=1.0, help="Weight for distilled loss (Eq.3)")
     args = parser.parse_args()
     
-    dist.init_process_group(backend="globo") 
+    dist.init_process_group(backend="gloo") 
     local_rank = int(os.environ["LOCAL_RANK"])
     
     train_student(
