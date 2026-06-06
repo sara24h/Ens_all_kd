@@ -232,23 +232,18 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
     print(f"Saved: baseline_student_{dataset_mode}_{kd_method}.pth")
 
 # ====================== اجرا ======================
+import argparse
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="KD Training")
+    parser.add_argument('--mode', type=str, required=True, help="140k, 190k, or 200k")
+    parser.add_argument('--method', type=str, required=True, help="logits, at, or rkd")
+    parser.add_argument('--path', type=str, required=True, help="Path to teacher pth")
+    
+    args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 140k → AT
-    train_student(teacher_path="/kaggle/input/models/sara24h/teacher_model_best/pytorch/default/1/teacher_model_best.pth",
-                  dataset_mode='140k',
-                  kd_method='at',
-                  epochs=30, lr=0.005, device=device)
-
-    # 190k → Logits
-    train_student(teacher_path="/kaggle/input/datasets/sara24h/kdfs-190k-transfer-learning-data/KDFS-Pearson-2/teacher_dir/teacher_model_best.pth",
-                  dataset_mode='190k',
-                  kd_method='logits',
-                  epochs=30, lr=0.005, device=device)
-
-    # 200k → RKD
-    train_student(teacher_path="/kaggle/input/datasets/sarah20079/teacher-model-best-200k/KDFS-Pearson-2/teacher_dir/teacher_model_best.pth",
-                  dataset_mode='200k',
-                  kd_method='rkd',
-                  epochs=30, lr=0.005, device=device)
+    train_student(teacher_path=args.path, 
+                  dataset_mode=args.mode, 
+                  kd_method=args.method, 
+                  device=device)
