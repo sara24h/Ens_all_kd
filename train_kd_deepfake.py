@@ -116,17 +116,51 @@ class Dataset_selector:
 # ==========================================
 # 2. KD Losses (بدون تغییر)
 # ==========================================
+# ==========================================
+# 2. KD Losses (اصلاح شده برای AT)
+# ==========================================
+
 def logits_loss(teacher_logits, student_logits):
     return F.mse_loss(teacher_logits, student_logits)
 
 def at_loss(teacher_features, student_features):
     loss = 0.0
+    
+    # در اینجا فرض بر این است که teacher_features و student_features لیستی از Feature Maps هستند.
+    # باید برای هر جفت (استاد، دانشجو) کار را انجام دهیم.
     for t_feat, s_feat in zip(teacher_features, student_features):
-        t_att = F.normalize(t_feat.pow(2).mean(1).view(t_feat.size(0), -1), dim=1)
-        s_att = F.normalize(s_feat.pow(2).mean(1).view(s_feat.size(0), -1), dim=1)
+        # 1. محاسبه ابعاد فعلی
+        # t_feat shape: [Batch, Channels_T, H_T, W_T]
+        # s_feat shape: [Batch, Channels_S, H_S, W_S]
+        
+        # گام 1: تبدیل به Attention Map (Sum of Squared Activation)
+        # فرمول مقاله: A = sum(F^2) over channels -> result: [Batch, 1, H, W]
+        t_att = t_feat.pow(2).mean(1).view(t_feat.size(0), -1) # Shape: [Batch, H_T * W_T]
+        s_att = s_feat.pow(2).mean(1).view(s_feat.size(0), -1) # Shape: [Batch, H_S * W_S]
+        
+        # **اینجا مشکل شما حل میشود**
+        # چون مدل استاد و دانشجو متفاوت هستند، H_T*W_T با H_S*W_S برابر نیست (مثلا 1024 برابر 65536 نیست).
+        # باید ویژگی دانشجو را تغییر سایز دهیم تا به ابعاد استاد برسد.
+        
+        # پیدا کردن ابعاد هدف (استاد)
+        target_size = t_att.shape[1]
+        
+        # تغییر سایز Attention Map دانشجو با AdaptiveAvgPool1D
+        # این کار به ما اجازه می‌دهد بدون در نظر گرفتن ابعاد دقیق، آن‌ها را هم سایز کنیم
+        if s_att.shape[1] != target_size:
+            s_att = F.adaptive_avg_pool1d(s_att.unsqueeze(1), target_size).squeeze(1)
+            
+        # حالا هر دو سایز یکسان دارند: [Batch, target_size]
+        # 2. نرمال‌سازی (L2 Normalization)
+        t_att = F.normalize(t_att, dim=1)
+        s_att = F.normalize(s_att, dim=1)
+        
+        # 3. محاسبه Loss
         loss += F.mse_loss(s_att, t_att)
+        
     return loss
 
+# بقیه کدها (RKDLoss و...) بدون تغییر باقی می‌مانند
 class RKDLoss(nn.Module):
     def __init__(self, alpha=1.0, beta=2.0):
         super().__init__()
