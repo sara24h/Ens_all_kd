@@ -396,8 +396,7 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # راه‌اندازی Process Group برای DDP
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="gloo")
     
     # گرفتن شماره GPU مربوط به این پردازش específico
     local_rank = int(os.environ["LOCAL_RANK"])
