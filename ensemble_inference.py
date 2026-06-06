@@ -85,28 +85,55 @@ class DeepfakeEnsemble:
 
 
 # ====================== اجرا ======================
+import argparse
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--dataset_mode",
+        type=str,
+        default="200k",
+        choices=["140k", "190k", "200k"]
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=64
+    )
+
+    parser.add_argument(
+        "--test_csv",
+        type=str,
+        required=True
+    )
+
+    parser.add_argument(
+        "--root_dir",
+        type=str,
+        required=True
+    )
+
+    args = parser.parse_args()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # مسیر سه مدل دانش‌آموز (دقیقاً مثل مقاله: سه مدل با روش متفاوت)
+
     model_paths = [
-        "student_140k_at.pth",       # Feature-based (AT)
-        "student_190k_logits.pth",   # Response-based (Logits)
-        "student_200k_rkd.pth"       # Relation-based (RKD)
+        "student_140k_at.pth",
+        "student_190k_logits.pth",
+        "student_200k_rkd.pth"
     ]
-    
+
     ensemble = DeepfakeEnsemble(model_paths, device=device)
-    
-    # مثال: ارزیابی روی تست ست 200k (یا هر دیتاست دیگری)
-    from your_dataset_file import Dataset_selector   # فایل Dataset_selector خودت
-    
+
     ds = Dataset_selector(
-        dataset_mode='200k',
-        realfake200k_test_csv='/kaggle/input/undersampled-200k/balanced_unique_200k_dataset/test_labels.csv',
-        realfake200k_root_dir='/kaggle/input/undersampled-200k/balanced_unique_200k_dataset',
-        eval_batch_size=64,
+        dataset_mode=args.dataset_mode,
+        realfake200k_test_csv=args.test_csv,
+        realfake200k_root_dir=args.root_dir,
+        eval_batch_size=args.batch_size,
         ddp=False
     )
-    
-    test_loader = ds.loader_test
-    ensemble.evaluate(test_loader, dataset_name="200k Test Set")
+
+    ensemble.evaluate(ds.loader_test,
+                      dataset_name=f"{args.dataset_mode} Test Set")
