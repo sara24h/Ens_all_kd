@@ -154,10 +154,10 @@ class Dataset_selector:
             print(f"DataLoaders ready - Train batches: {len(self.loader_train)}, Val: {len(self.loader_val)}, Test: {len(self.loader_test)}")
 
 # ====================== KD Losses ======================
-def logits_loss(teacher_logits, student_logits, T=4.0):
-    teacher_prob = torch.sigmoid(teacher_logits / T)
-    student_prob = torch.sigmoid(student_logits / T)
-    return F.kl_div(torch.log(student_prob + 1e-8), teacher_prob, reduction='batchmean') * (T ** 2)
+# فرمول دقیق مقاله (معادل فرمول شماره 2)
+def logits_loss(teacher_logits, student_logits):
+    # استفاده از MSE بین logits خام بدون هیچ دمایی
+    return F.mse_loss(teacher_logits, student_logits)
 
 def at_loss(teacher_features, student_features):
     loss = 0.0
@@ -273,7 +273,6 @@ class ResNetStudent(nn.Module):
         return logit, self.features
 
 # ====================== Training Function ======================
-# ====================== Training Function ======================
 def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                   epochs=30, lr=0.005, batch_size=64):
     
@@ -343,27 +342,24 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
             with autocast('cuda'): 
                 with torch.no_grad():
                     teacher_logits, _ = teacher(images)
-                    # دسترسی مستقیم به فیچرهای هوک شده (چون معلم DDP نیست)
                     teacher_feats = teacher.features  
                 
                 student_logits, _ = student(images)
-                # دسترسی به فیچرهای هوک شده از طریق .module (چون دانش‌آموز DDP است)
                 student_feats = student.module.features 
                 
                 base_loss = criterion(student_logits, labels)
                 
                 if kd_method == 'logits':
-                    kd_loss = logits_loss(teacher_logits, student_logits, T=4.0)
-                    loss = 0.6 * base_loss + 0.4 * kd_loss
+                    kd_loss = logits_loss(teacher_logits, student_logits)
+                    loss = base_loss + kd_loss
                 elif kd_method == 'at':
                     kd_loss = at_loss(teacher_feats, student_feats)
-                    loss = base_loss + 0.4 * kd_loss
+                    loss = base_loss + kd_loss
                 elif kd_method == 'rkd':
-                    # دسترسی مستقیم به avgpool در معلم و دسترسی از طریق module در دانش‌آموز
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
                     s_emb = student.module.model.avgpool(student_feats[-1]).flatten(1)
                     rkd_loss_val = rkd_criterion(t_emb, s_emb)
-                    loss = base_loss + 0.5 * rkd_loss_val
+                    loss = base_loss + rkd_loss_val
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -378,7 +374,6 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
             print(f"Epoch {epoch+1}/{epochs} | Loss: {running_loss/len(train_loader):.4f}")
 
     if local_rank == 0:
-        # ذخیره state_dict از داخل student.module
         torch.save(student.module.state_dict(), f"student_{dataset_mode}_{kd_method}_amp_ddp.pth")
         print(f"Model saved successfully by Rank 0.")
 
@@ -391,19 +386,21 @@ if __name__ == "__main__":
     parser.add_argument('--method', type=str, required=True, help="logits, at, or rkd")
     parser.add_argument('--path', type=str, required=True, help="Path to teacher pth")
     
+    # <<<<<<<<<< اضافه شدن پارامتر epochs >>>>>>>>>>
+    parser.add_argument('--epochs', type=int, default=30, help="Number of training epochs")
+    
     args = parser.parse_args()
     
     dist.init_process_group(backend="gloo")
     
-    # گرفتن شماره GPU مربوط به این پردازش específico
     local_rank = int(os.environ["LOCAL_RANK"])
     
     train_student(
         local_rank=local_rank,
         teacher_path=args.path, 
         dataset_mode=args.mode, 
-        kd_method=args.method
+        kd_method=args.method,
+        epochs=args.epochs   # <<<<<<<<<< پاس دادن مقدار به تابع >>>>>>>>>>
     )
     
-    # پاکسازی منابع DDP
     dist.destroy_process_group()
