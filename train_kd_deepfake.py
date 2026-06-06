@@ -70,7 +70,7 @@ class Dataset_selector:
         elif dataset_mode == '200k':
             mean = (0.4460, 0.3622, 0.3416)
             std = (0.2057, 0.1849, 0.1761)
-        else dataset_mode == '190k':
+        elif dataset_mode == '190k':
             mean = (0.4668, 0.3816, 0.3414)
             std = (0.2410, 0.2161, 0.2081)
 
