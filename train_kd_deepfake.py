@@ -149,7 +149,8 @@ class Dataset_selector:
 
         # Check missing images
         for split_name, data in [('train', train_data), ('val', val_data), ('test', test_data)]:
-            missing = [os.path.join(root_dir, p) for p in data['images_id'] if not os.path.exists(os.path.join(root_dir, p))]
+    # استفاده از img_column به جای images_id
+            missing = [os.path.join(root_dir, p) for p in data[img_column] if not os.path.exists(os.path.join(root_dir, p))]
             print(f"{split_name} missing images: {len(missing)}")
             if missing:
                 print(f"Sample missing: {missing[:3]}")
