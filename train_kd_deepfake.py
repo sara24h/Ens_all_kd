@@ -43,9 +43,6 @@ class Dataset_selector:
     def __init__(
         self,
         dataset_mode,
-        rvf10k_train_csv=None,
-        rvf10k_valid_csv=None,
-        rvf10k_root_dir=None,
         realfake140k_train_csv=None,
         realfake140k_valid_csv=None,
         realfake140k_test_csv=None,
@@ -55,34 +52,27 @@ class Dataset_selector:
         realfake200k_test_csv=None,
         realfake200k_root_dir=None,
         realfake190k_root_dir=None,
-        realfake330k_root_dir=None,
         train_batch_size=32,
         eval_batch_size=32,
         num_workers=8,
         pin_memory=True,
         ddp=False,
     ):
-        if dataset_mode not in ['hardfake', 'rvf10k', '140k', '190k', '200k', '330k']:
+        if dataset_mode not in ['140k', '190k', '200k']:
             raise ValueError("dataset_mode must be 'hardfake', 'rvf10k', '140k', '190k', '200k', or '330k'")
         self.dataset_mode = dataset_mode
 
-        image_size = (256, 256) if dataset_mode in ['rvf10k', '140k', '190k', '200k', '330k'] else (300, 300)
+        image_size = (256, 256) if dataset_mode in ['140k', '190k', '200k'] else (300, 300)
 
-        if dataset_mode == 'rvf10k':
-            mean = (0.5212, 0.4260, 0.3811)
-            std = (0.2486, 0.2238, 0.2211)
-        elif dataset_mode == '140k':
+        if dataset_mode == '140k':
             mean = (0.5207, 0.4258, 0.3806)
             std = (0.2490, 0.2239, 0.2212)
         elif dataset_mode == '200k':
             mean = (0.4460, 0.3622, 0.3416)
             std = (0.2057, 0.1849, 0.1761)
-        elif dataset_mode == '190k':
+        else dataset_mode == '190k':
             mean = (0.4668, 0.3816, 0.3414)
             std = (0.2410, 0.2161, 0.2081)
-        else:
-            mean = (0.4923, 0.4042, 0.3624)
-            std = (0.2446, 0.2198, 0.2141)
 
         transform_train = transforms.Compose([
             transforms.Resize(image_size),
@@ -103,28 +93,7 @@ class Dataset_selector:
         root_dir = None
         train_data = val_data = test_data = None
 
-        if dataset_mode == 'rvf10k':
-            if not rvf10k_train_csv or not rvf10k_valid_csv or not rvf10k_root_dir:
-                raise ValueError("rvf10k_train_csv, rvf10k_valid_csv, and rvf10k_root_dir must be provided")
-            train_data = pd.read_csv(rvf10k_train_csv)
-            def create_image_path(row, split='train'):
-                folder = 'fake' if row['label'] == 0 else 'real'
-                img_name = row['id']
-                img_name = os.path.basename(img_name)
-                if not img_name.endswith('.jpg'):
-                    img_name += '.jpg'
-                return os.path.join('rvf10k', split, folder, img_name)
-            train_data['images_id'] = train_data.apply(lambda row: create_image_path(row, 'train'), axis=1)
-            valid_data = pd.read_csv(rvf10k_valid_csv)
-            valid_data['images_id'] = valid_data.apply(lambda row: create_image_path(row, 'valid'), axis=1)
-            val_data, test_data = train_test_split(
-                valid_data, test_size=0.5, stratify=valid_data['label'], random_state=3407
-            )
-            val_data = val_data.reset_index(drop=True)
-            test_data = test_data.reset_index(drop=True)
-            root_dir = rvf10k_root_dir
-
-        elif dataset_mode == '140k':
+        if dataset_mode == '140k':
             if not realfake140k_train_csv or not realfake140k_valid_csv or not realfake140k_test_csv or not realfake140k_root_dir:
                 raise ValueError("realfake140k_train_csv, realfake140k_valid_csv, realfake140k_test_csv, and realfake140k_root_dir must be provided")
             train_data = pd.read_csv(realfake140k_train_csv)
@@ -177,29 +146,7 @@ class Dataset_selector:
             train_data = train_data.sample(frac=1, random_state=None).reset_index(drop=True)
             val_data = val_data.sample(frac=1, random_state=None).reset_index(drop=True)
             test_data = test_data.sample(frac=1, random_state=None).reset_index(drop=True)
-
-        elif dataset_mode == '330k':
-            if not realfake330k_root_dir:
-                raise ValueError("realfake330k_root_dir must be provided")
-            root_dir = realfake330k_root_dir
-            def collect_images_from_folder(split):
-                data = []
-                for label in ['Real', 'Fake']:
-                    folder_path = os.path.join(root_dir, split, label)
-                    if not os.path.exists(folder_path):
-                        raise FileNotFoundError(f"Folder not found: {folder_path}")
-                    for img_name in os.listdir(folder_path):
-                        if img_name.endswith(('.jpg', '.jpeg', '.png')):
-                            img_path = os.path.join(split, label, img_name)
-                            data.append({'images_id': img_path, 'label': label})
-                return pd.DataFrame(data)
-            train_data = collect_images_from_folder('train')
-            val_data = collect_images_from_folder('valid')
-            test_data = collect_images_from_folder('test')
-            train_data = train_data.sample(frac=1, random_state=3407).reset_index(drop=True)
-            val_data = val_data.sample(frac=1, random_state=3407).reset_index(drop=True)
-            test_data = test_data.sample(frac=1, random_state=3407).reset_index(drop=True)
-
+            
         # Debug statistics
         print(f"{dataset_mode} dataset statistics:")
         print(f"Total train: {len(train_data)} | val: {len(val_data)} | test: {len(test_data)}")
