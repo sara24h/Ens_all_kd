@@ -114,66 +114,114 @@ class Dataset_selector:
         if rank == 0: print(f"DataLoaders ready - Train: {len(self.loader_train)}, Val: {len(self.loader_val)}, Test: {len(self.loader_test)}")
 
 # ==========================================
-# 2. KD Losses (بدون تغییر)
-# ==========================================
-# ==========================================
-# 2. KD Losses (اصلاح شده برای AT)
+# 2. KD Losses (اصلاح شده مطابق مقاله)
 # ==========================================
 
 def logits_loss(teacher_logits, student_logits):
     return F.mse_loss(teacher_logits, student_logits)
 
+# ==========================================
+# 2-1. AT Loss (اصلاح شده مطابق فرمول ۴ مقاله)
+# ==========================================
+# فرمول مقاله (معادله ۴):
+#   L_AT = Σ_j || Q_S^j / ||Q_S^j||_2  -  Q_T^j / ||Q_T^j||_2 ||_2^2
+#
+# مراحل:
+#   1. محاسبه Attention Map: Q = Σ(F^2) over channels → vectorize → [B, H*W]
+#   2. نرمال‌سازی L2 هر بردار: Q_hat = Q / ||Q||_2
+#   3. محاسبه فاصله: ||Q_S_hat - Q_T_hat||_2^2
+# ==========================================
+
 def at_loss(teacher_features, student_features):
     loss = 0.0
     
-    # در اینجا فرض بر این است که teacher_features و student_features لیستی از Feature Maps هستند.
-    # باید برای هر جفت (استاد، دانشجو) کار را انجام دهیم.
     for t_feat, s_feat in zip(teacher_features, student_features):
-        # 1. محاسبه ابعاد فعلی
-        # t_feat shape: [Batch, Channels_T, H_T, W_T]
-        # s_feat shape: [Batch, Channels_S, H_S, W_S]
+        # گام ۱: محاسبه Attention Map (Sum of Squared Activations over channels)
+        # مقاله: Q = vec(Σ_c F_c^2) → شکل: [Batch, H*W]
+        t_att = t_feat.pow(2).sum(1).view(t_feat.size(0), -1)  # [B, H_T * W_T]
+        s_att = s_feat.pow(2).sum(1).view(s_feat.size(0), -1)  # [B, H_S * W_S]
         
-        # گام 1: تبدیل به Attention Map (Sum of Squared Activation)
-        # فرمول مقاله: A = sum(F^2) over channels -> result: [Batch, 1, H, W]
-        t_att = t_feat.pow(2).mean(1).view(t_feat.size(0), -1) # Shape: [Batch, H_T * W_T]
-        s_att = s_feat.pow(2).mean(1).view(s_feat.size(0), -1) # Shape: [Batch, H_S * W_S]
-        
-        # **اینجا مشکل شما حل میشود**
-        # چون مدل استاد و دانشجو متفاوت هستند، H_T*W_T با H_S*W_S برابر نیست (مثلا 1024 برابر 65536 نیست).
-        # باید ویژگی دانشجو را تغییر سایز دهیم تا به ابعاد استاد برسد.
-        
-        # پیدا کردن ابعاد هدف (استاد)
+        # تغییر سایز Attention Map دانشجو برای تطبیق با ابعاد معلم
         target_size = t_att.shape[1]
-        
-        # تغییر سایز Attention Map دانشجو با AdaptiveAvgPool1D
-        # این کار به ما اجازه می‌دهد بدون در نظر گرفتن ابعاد دقیق، آن‌ها را هم سایز کنیم
         if s_att.shape[1] != target_size:
             s_att = F.adaptive_avg_pool1d(s_att.unsqueeze(1), target_size).squeeze(1)
             
-        # حالا هر دو سایز یکسان دارند: [Batch, target_size]
-        # 2. نرمال‌سازی (L2 Normalization)
-        t_att = F.normalize(t_att, dim=1)
-        s_att = F.normalize(s_att, dim=1)
+        # گام ۲: نرمال‌سازی L2 هر بردار توجه: Q / ||Q||_2
+        t_att = F.normalize(t_att, p=2, dim=1)
+        s_att = F.normalize(s_att, p=2, dim=1)
         
-        # 3. محاسبه Loss
-        loss += F.mse_loss(s_att, t_att)
+        # گام ۳: محاسبه || Q_S_hat - Q_T_hat ||_2^2
+        # ||v||_2^2 = Σ v_i^2 → sum over spatial, then mean over batch
+        loss += (s_att - t_att).pow(2).sum(1).mean()
         
     return loss
 
-# بقیه کدها (RKDLoss و...) بدون تغییر باقی می‌مانند
+# ==========================================
+# 2-2. RKD Loss (اصلاح شده مطابق فرمول ۶-۷ مقاله و مقاله اصلی Park et al.)
+# ==========================================
+# فرمول مقاله (معادله ۶):
+#   L_RKD = Σ_{(x1,...,xn)∈χ_N} l_δ(φ(f_T(x1),...,f_T(xn)), φ(f_S(x1),...,f_S(xn)))
+#
+# Distance-wise (χ₂ — جفت‌ها):
+#   d_ij = ||h_i - h_j||_2    (فاصله اقلیدسی خام)
+#   d̂_ij = d_ij / d̄          (نرمال‌سازی با میانگین فاصله بچ)
+#   لس = l_δ(d̂^T, d̂^S)
+#
+# Angle-wise (χ₃ — سه‌تایی‌ها):
+#   e_ij = (h_i - h_j) / ||h_i - h_j||_2   (بردار واحد از j به i)
+#   θ_ijk = arccos(e_ij · e_kj)             (زاویه در نقطه j بین i→j و k→j)
+#   لس = l_δ(θ^T, θ^S)
+#
+# l_δ = Huber Loss (معادله ۷):
+#   l_δ(x, y) = 0.5(x-y)²         اگر |x-y| < 1
+#   l_δ(x, y) = |x-y| - 0.5      در غیر این صورت
+#   (معادل F.smooth_l1_loss با delta=1)
+# ==========================================
+
 class RKDLoss(nn.Module):
     def __init__(self, alpha=1.0, beta=2.0):
         super().__init__()
         self.alpha, self.beta = alpha, beta
+
     def forward(self, teacher_emb, student_emb):
         with torch.no_grad():
-            t_dist, t_angle = self.pairwise_distance(teacher_emb), self.pairwise_angle(teacher_emb)
-        s_dist, s_angle = self.pairwise_distance(student_emb), self.pairwise_angle(student_emb)
+            t_dist = self.pairwise_distance(teacher_emb)
+            t_angle = self.pairwise_angle(teacher_emb)
+        s_dist = self.pairwise_distance(student_emb)
+        s_angle = self.pairwise_angle(student_emb)
         return self.alpha * F.smooth_l1_loss(s_dist, t_dist) + self.beta * F.smooth_l1_loss(s_angle, t_angle)
+
     def pairwise_distance(self, x):
-        x = F.normalize(x, p=2, dim=1); return torch.cdist(x, x, p=2)
+        # χ₂: فاصله اقلیدسی خام بین تمام جفت نمونه‌ها
+        dist = torch.cdist(x, x, p=2)
+        # نرمال‌سازی با میانگین فاصله بچ (مطابق مقاله اصلی RKD)
+        return dist / (dist.mean().detach() + 1e-6)
+
     def pairwise_angle(self, x):
-        x = F.normalize(x, p=2, dim=1); return torch.acos(torch.clamp(torch.mm(x, x.t()), -1.0 + 1e-7, 1.0 - 1e-7))
+        # χ₃: زاویه در نقطه j بین بردار i→j و بردار k→j
+        # مطابق فرمول اصلی RKD (Park et al.)
+        #
+        # گام ۱: محاسبه بردارهای واحد جهت‌دار
+        #   e[i,j] = (h_i - h_j) / ||h_i - h_j||_2   (بردار واحد از j به i)
+        diff = x.unsqueeze(1) - x.unsqueeze(0)  # [B, B, D] — diff[i,j] = h_i - h_j
+        norm = torch.norm(diff, p=2, dim=2, keepdim=True)  # [B, B, 1]
+        e = diff / (norm + 1e-8)  # [B, B, D] — بردارهای واحد
+
+        # گام ۲: محاسبه زاویه برای هر سه‌تایی (i, j, k)
+        #   cos(θ_ijk) = e[i,j] · e[k,j]
+        #   θ_ijk = arccos(cos(θ_ijk))
+        #
+        # برای هر j، باید ضرب داخلی تمام جفت‌های e[:,j] را محاسبه کنیم:
+        #   cosine[j, i, k] = e[i,j,:] · e[k,j,:]
+        # این معادل batch matrix multiplication است:
+        #   e^T: [B, D, B] → bmm(e^T, e) → [B, B, B]
+        cosine = torch.bmm(e.permute(1, 0, 2), e.permute(1, 2, 0))  # [B, B, B]
+
+        # گام ۳: محاسبه زاویه
+        angle = torch.acos(torch.clamp(cosine, -1.0 + 1e-7, 1.0 - 1e-7))  # [B, B, B]
+
+        # نرمال‌سازی با میانگین زاویه (مشابه distance-wise)
+        return angle / (angle.mean().detach() + 1e-6)
 
 # ==========================================
 # 3. Models (بدون تغییر)
@@ -230,10 +278,25 @@ class ResNetStudent(nn.Module):
         self.features.clear(); return self.model(x), self.features
 
 # ==========================================
-# 4. Training Function (اصلاح شده)
+# 4. Training Function (اصلاح شده با α و β مطابق معادله ۳ مقاله)
 # ==========================================
+# مقاله (معادله ۳):
+#   L_Total_logits = α * L_S(y, z_s) + β * L_logits(z_t, z_s)
+#
+# مقاله (معادله ۵):
+#   L_Total_AT = L_S(y, z_s) + L_AT(Q_T, Q_S)
+#
+# مقاله (معادله ۸):
+#   L_Total_RKD = L_S(y, z_s) + L_RKD(t, s)
+# ==========================================
+
 def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
-                  epochs=200, lr=0.1, momentum=0.9, weight_decay=0.0005, batch_size=64):
+                  epochs=200, lr=0.1, momentum=0.9, weight_decay=0.0005, batch_size=64,
+                  alpha=1.0, beta=1.0):
+    # alpha: وزن Student Loss (L_S) — مطابق مقاله
+    # beta:  وزن Distilled Loss (L_logits) — مطابق مقاله
+    # نکته: برای AT و RKD مقاله α=1 فرض کرده (جمع ساده)،
+    #        اما برای logits ضرایب α و β صریحاً در معادله ۳ ذکر شده‌اند.
     
     torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
@@ -250,8 +313,6 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
 
     optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True)
     
-    # ---- اصلاح باگ اسکجولر ----
-    # اگر ایپاک ها کمتر از 10 باشد، دیگر از MultiStepLR استفاده نمی‌کنیم تا LR صفر نشود
     if epochs > 10:
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[int(epochs*0.5), int(epochs*0.75)], gamma=0.1)
         if local_rank == 0: print(f"\n[Info] LR milestones at epochs: {int(epochs*0.5)} and {int(epochs*0.75)}")
@@ -261,13 +322,12 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
 
     criterion = nn.BCEWithLogitsLoss()
     
-    # ---- تنظیمات فوق‌العاده پایدار GradScaler ----
     scaler = GradScaler(
         device='cuda',
-        init_scale=1024,         # شروع ملایم
-        growth_factor=2.0,       # تهاجمی بالا رفتن اسکیل
-        backoff_factor=0.25,     # بسیار محافظه کارانه پایین آمدن اسکیل اگر NaN دید (پیش فرض 0.5 است)
-        growth_interval=2000     # آپدیت هر 2000 بچ
+        init_scale=1024,
+        growth_factor=2.0,
+        backoff_factor=0.25,
+        growth_interval=2000
     )
     
     rkd_criterion = RKDLoss().to(device) if kd_method == 'rkd' else None
@@ -280,6 +340,11 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
         ds = Dataset_selector(dataset_mode='200k', realfake200k_val_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/val_labels.csv', realfake200k_test_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/test_labels.csv', realfake200k_train_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/train_labels.csv', realfake200k_root_dir='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset', train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
                               
     train_loader, train_sampler = ds.loader_train, ds.train_sampler
+
+    if local_rank == 0:
+        print(f"[Info] KD Method: {kd_method}")
+        if kd_method == 'logits':
+            print(f"[Info] Loss = {alpha} * L_student + {beta} * L_logits  (Eq.3)")
 
     for epoch in range(epochs):
         student.train()
@@ -298,9 +363,15 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                 student_logits, student_feats = student(images)
                 base_loss = criterion(student_logits, labels)
                 
-                if kd_method == 'logits': loss = base_loss + logits_loss(teacher_logits, student_logits)
-                elif kd_method == 'at': loss = base_loss + at_loss(teacher_feats, student_feats)
+                # ---- محاسبه Loss مطابق فرمول‌های مقاله ----
+                if kd_method == 'logits':
+                    # معادله ۳: L = α * L_S + β * L_logits
+                    loss = alpha * base_loss + beta * logits_loss(teacher_logits, student_logits)
+                elif kd_method == 'at':
+                    # معادله ۵: L = L_S + L_AT  (بدون α/β در مقاله)
+                    loss = base_loss + at_loss(teacher_feats, student_feats)
                 elif kd_method == 'rkd':
+                    # معادله ۸: L = L_S + L_RKD  (بدون α/β در مقاله)
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
                     s_emb = student_feats[-1] if not isinstance(student_feats, list) else student.module.model.avgpool(student_feats[-1]).flatten(1)
                     loss = base_loss + rkd_criterion(t_emb, s_emb)
@@ -376,15 +447,18 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=0.1, help="Initial learning rate")
     parser.add_argument('--momentum', type=float, default=0.9, help="SGD momentum")
     parser.add_argument('--weight_decay', type=float, default=0.0005, help="Weight decay")
+    parser.add_argument('--alpha', type=float, default=1.0, help="Weight for student loss (Eq.3)")
+    parser.add_argument('--beta', type=float, default=1.0, help="Weight for distilled loss (Eq.3)")
     args = parser.parse_args()
     
-    dist.init_process_group(backend="gloo") 
+    dist.init_process_group(backend="globo") 
     local_rank = int(os.environ["LOCAL_RANK"])
     
     train_student(
         local_rank=local_rank, teacher_path=args.path, dataset_mode=args.mode, 
         kd_method=args.method, epochs=args.epochs, lr=args.lr, 
-        momentum=args.momentum, weight_decay=args.weight_decay
+        momentum=args.momentum, weight_decay=args.weight_decay,
+        alpha=args.alpha, beta=args.beta
     )
     
     dist.destroy_process_group()
