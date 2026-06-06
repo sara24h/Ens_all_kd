@@ -131,8 +131,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # 1. راه‌اندازی DDP
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="gloo")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
