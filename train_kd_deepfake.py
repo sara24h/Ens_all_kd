@@ -273,6 +273,7 @@ class ResNetStudent(nn.Module):
         return logit, self.features
 
 # ====================== Training Function ======================
+# ====================== Training Function ======================
 def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                   epochs=30, lr=0.005, batch_size=64):
     
@@ -280,7 +281,7 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
     
-    # 2. آماده سازی معلم
+    # 2. آماده سازی معلم (بدون DDP)
     teacher = ResNetTeacher().to(device)
     ckpt = torch.load(teacher_path, map_location=device)
     state = ckpt.get('state_dict') or ckpt.get('model') or ckpt
@@ -292,8 +293,7 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     # 3. آماده سازی دانش‌آموز
     student = ResNetStudent().to(device)
     
-    # 4. پیچیدن مدل‌ها در DDP
-    teacher = DDP(teacher, device_ids=[local_rank])
+    # 4. پیچیدن فقط دانش‌آموز در DDP
     student = DDP(student, device_ids=[local_rank])
 
     optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
@@ -301,7 +301,6 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     criterion = nn.BCEWithLogitsLoss()
     scaler = GradScaler('cuda')
     
-    # اینسنتس کردن RKD خارج از حلقه برای جلوگیری از ایجاد مدل تکراری
     rkd_criterion = RKDLoss().to(device) if kd_method == 'rkd' else None
 
     # 5. لود دادهها با فعال بودن DDP
@@ -330,13 +329,11 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     for epoch in range(epochs):
         student.train()
         
-        # بسیار مهم: برای Shuffle کردن داده‌ها در هر ایپاک برای DDP
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
             
         running_loss = 0.0
         
-        # فقط در رنک صفر پراگرس بار را نشان بده تا لاگ‌ها به هم نریزد
         data_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}") if local_rank == 0 else train_loader
         
         for i, (images, labels) in enumerate(data_iter):
@@ -346,10 +343,11 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
             with autocast('cuda'): 
                 with torch.no_grad():
                     teacher_logits, _ = teacher(images)
-                    # دسترسی به فیچرهای هوک شده در DDP از طریق .module
-                    teacher_feats = teacher.module.features  
+                    # دسترسی مستقیم به فیچرهای هوک شده (چون معلم DDP نیست)
+                    teacher_feats = teacher.features  
                 
                 student_logits, _ = student(images)
+                # دسترسی به فیچرهای هوک شده از طریق .module (چون دانش‌آموز DDP است)
                 student_feats = student.module.features 
                 
                 base_loss = criterion(student_logits, labels)
@@ -361,8 +359,8 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                     kd_loss = at_loss(teacher_feats, student_feats)
                     loss = base_loss + 0.4 * kd_loss
                 elif kd_method == 'rkd':
-                    # دسترسی به avgpool از طریق .module در DDP
-                    t_emb = teacher.module.model.avgpool(teacher_feats[-1]).flatten(1)
+                    # دسترسی مستقیم به avgpool در معلم و دسترسی از طریق module در دانش‌آموز
+                    t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
                     s_emb = student.module.model.avgpool(student_feats[-1]).flatten(1)
                     rkd_loss_val = rkd_criterion(t_emb, s_emb)
                     loss = base_loss + 0.5 * rkd_loss_val
@@ -379,9 +377,8 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
         if local_rank == 0:
             print(f"Epoch {epoch+1}/{epochs} | Loss: {running_loss/len(train_loader):.4f}")
 
-    # ذخیره مدل فقط توسط GPU اصلی (رنک 0)
     if local_rank == 0:
-        # دقت کنید که state_dict را از student.module می‌گیریم تا فرمت استاندارد ذخیره شود
+        # ذخیره state_dict از داخل student.module
         torch.save(student.module.state_dict(), f"student_{dataset_mode}_{kd_method}_amp_ddp.pth")
         print(f"Model saved successfully by Rank 0.")
 
