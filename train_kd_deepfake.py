@@ -238,13 +238,22 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
 
     if local_rank == 0: print(f"\n[Info] LR milestones at epochs: {int(epochs*0.5)} and {int(epochs*0.75)}")
 
+    # متغیر برای نگه داشتن نوار پیشرفت آخرین ایپوک
+    last_epoch_pbar = None
+
     # حلقه آموزش
     for epoch in range(epochs):
         student.train()
         if train_sampler is not None: train_sampler.set_epoch(epoch)
         
         running_loss, running_corrects, total_samples = 0.0, 0, 0
-        data_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}") if local_rank == 0 else train_loader
+        
+        # ذخیره نوار پیشرفت در متغیر (برای ایپوک آخر از پاک شدن جلوگیری می‌کند)
+        if local_rank == 0:
+            data_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=(epoch == epochs - 1))
+            last_epoch_pbar = data_iter
+        else:
+            data_iter = train_loader
         
         for i, (images, labels) in enumerate(data_iter):
             images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
@@ -253,14 +262,19 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                 with torch.no_grad():
                     teacher_logits, teacher_feats = teacher(images)
                 
-                student_logits, student_feats = student(images)
+                student_outputs = student(images)
+                student_logits = student_outputs[0]
+                student_feats = student_outputs[1]
+                
                 base_loss = criterion(student_logits, labels)
                 
-                if kd_method == 'logits': loss = base_loss + logits_loss(teacher_logits, student_logits)
-                elif kd_method == 'at': loss = base_loss + at_loss(teacher_feats, student_feats.module.features)
+                if kd_method == 'logits': 
+                    loss = base_loss + logits_loss(teacher_logits, student_logits)
+                elif kd_method == 'at': 
+                    loss = base_loss + at_loss(teacher_feats, student_feats)
                 elif kd_method == 'rkd':
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
-                    s_emb = student_feats[-1] if not isinstance(student_feats, list) else student.module.model.avgpool(student_feats[-1]).flatten(1)
+                    s_emb = student.module.model.avgpool(student_feats[-1]).flatten(1)
                     loss = base_loss + rkd_criterion(t_emb, s_emb)
 
             optimizer.zero_grad()
@@ -283,37 +297,44 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     # ==========================================
     # 5. محاسبه دقت تست و سیو مدل (فقط در GPU اصلی)
     # ==========================================
-        # ==========================================
-    # 5. محاسبه دقت تست و سیو مدل (فقط در GPU اصلی)
-    # ==========================================
+    dist.barrier()
+    student.eval()
+
     if local_rank == 0:
-        print("\n" + "="*50)
-        print("Evaluating on Test Set...")
-        
-        # بسیار مهم: خروج مدل از حالت DDP برای جلوگیری از انتظار برای GPU های دیگر
         raw_student_model = student.module 
-        raw_student_model.eval() 
-        
         test_corrects, test_total = 0, 0
         
+        # نوار پیشرفت تست (با رنگ سبز برای تمایز)
+        test_pbar = tqdm(ds.loader_test, desc="Evaluating Test", colour='green')
+        
         with torch.no_grad():
-            for images, labels in tqdm(ds.loader_test, desc="Testing"):
+            for images, labels in test_pbar:
                 images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
                 
-                # استفاده از مدل خام به جای student (که DDP است)
                 logits, _ = raw_student_model(images)
                 preds = (torch.sigmoid(logits) > 0.5).float()
                 test_corrects += (preds == labels).sum().item()
                 test_total += labels.size(0)
                 
+                # نمایش دقت در لحظه روی نوار پیشرفت تست
+                current_test_acc = (test_corrects / test_total) * 100
+                test_pbar.set_postfix({'Test Acc': f'{current_test_acc:.2f}%'})
+                
         test_acc = (test_corrects / test_total) * 100
-        print(f"==> Final Test Accuracy (Single Student): {test_acc:.2f}%")
-        print("="*50 + "\n")
+        
+        # اضافه کردن دقت نهایی تست به همان نوار پیشرفتی که از ایپوک آخر باقی مانده بود
+        if last_epoch_pbar is not None:
+            last_epoch_pbar.set_postfix({
+                'Loss': f'{running_loss/len(train_loader):.4f}', 
+                'Train Acc': f'{(running_corrects/total_samples)*100:.2f}%',
+                'Final Test Acc': f'{test_acc:.2f}%'
+            })
+            
+        # چاپ خط پایانی برای سیو مدل
+        print(f"\n==> Model saved successfully. (Final Test Accuracy: {test_acc:.2f}%)")
 
         # ذخیره state_dict مدل خام
         torch.save(raw_student_model.state_dict(), f"student_{dataset_mode}_{kd_method}_amp_ddp.pth")
-        print(f"Model saved successfully.")
-
 # ==========================================
 # 6. اجرا
 # ==========================================
