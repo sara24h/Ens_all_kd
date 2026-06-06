@@ -226,11 +226,24 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
     
-    # آماده سازی معلم (بدون DDP)
     teacher = ResNetTeacher().to(device)
     ckpt = torch.load(teacher_path, map_location=device)
-    state = ckpt.get('state_dict') or ckpt.get('model') or ckpt
-    teacher.model.load_state_dict(state, strict=False)
+
+    if 'state_dict' in ckpt:
+        state = ckpt['state_dict']
+    elif 'model' in ckpt:
+        state = ckpt['model']
+    else:
+        state = ckpt
+
+    new_state = {k.replace('model.', ''): v for k, v in state.items()}
+    
+    try:
+        teacher.model.load_state_dict(new_state, strict=True)
+    except RuntimeError as e:
+        print(f"[Rank {local_rank}] WARNING: Teacher weights mismatch! {e}")
+        teacher.model.load_state_dict(new_state, strict=False)
+        
     teacher.eval()
     for p in teacher.parameters(): p.requires_grad = False
 
@@ -285,18 +298,17 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                 student_logits = student_outputs[0]
                 student_feats = student_outputs[1]
                 
-                base_loss = criterion(student_logits, labels)
+                # خیلی مهم: تبدیل به float32 قبل از محاسبه لاس برای جلوگیری از nan
+                base_loss = criterion(student_logits.float(), labels)
                 
                 if kd_method == 'logits': 
-                    loss = base_loss + logits_loss(teacher_logits, student_logits)
-                    
+                    loss = base_loss + logits_loss(teacher_logits.float(), student_logits.float())
                 elif kd_method == 'at': 
-                    loss = base_loss + at_loss(teacher_feats[:2], student_feats)
-                    
+                    loss = base_loss + at_loss(teacher_feats, student_feats)
                 elif kd_method == 'rkd':
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
                     s_emb = student.module.model.avgpool(student_feats[-1]).flatten(1)
-                    loss = base_loss + rkd_criterion(t_emb, s_emb)
+                    loss = base_loss + rkd_criterion(t_emb.float(), s_emb.float())
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
