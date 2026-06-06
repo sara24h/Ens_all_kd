@@ -160,19 +160,10 @@ class Dataset_selector:
         val_dataset = FaceDataset(val_data, root_dir, transform=transform_test, img_column=img_column)
         test_dataset = FaceDataset(test_data, root_dir, transform=transform_test, img_column=img_column)
 
-        # DataLoaders
-        if ddp:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
-            val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
-            test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, shuffle=False)
-
-            self.loader_train = DataLoader(train_dataset, batch_size=train_batch_size, sampler=train_sampler, num_workers=num_workers, pin_memory=pin_memory)
-            self.loader_val = DataLoader(val_dataset, batch_size=eval_batch_size, sampler=val_sampler, num_workers=num_workers, pin_memory=pin_memory)
-            self.loader_test = DataLoader(test_dataset, batch_size=eval_batch_size, sampler=test_sampler, num_workers=num_workers, pin_memory=pin_memory)
-        else:
-            self.loader_train = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
-            self.loader_val = DataLoader(val_dataset, batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
-            self.loader_test = DataLoader(test_dataset, batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+       
+        self.loader_train = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
+        self.loader_val = DataLoader(val_dataset, batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+        self.loader_test = DataLoader(test_dataset, batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
         print(f"DataLoaders ready - Train batches: {len(self.loader_train)}, Val: {len(self.loader_val)}, Test: {len(self.loader_test)}")
 
@@ -194,7 +185,7 @@ if __name__ == "__main__":
         realfake140k_root_dir='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces',
         train_batch_size=64,
         eval_batch_size=64,
-        ddp=True,
+        ddp=False,
     )
 
     # Example for 190k Real and Fake Faces
@@ -203,7 +194,7 @@ if __name__ == "__main__":
         realfake190k_root_dir='/kaggle/input/datasets/manjilkarki/deepfake-and-real-images/Dataset',
         train_batch_size=64,
         eval_batch_size=64,
-        ddp=True,
+        ddp=False,
     )
 
     # Example for 200k Real and Fake Faces
@@ -215,7 +206,7 @@ if __name__ == "__main__":
         realfake200k_root_dir='/kaggle/input/undersampled-200k/balanced_unique_200k_dataset',
         train_batch_size=64,
         eval_batch_size=64,
-        ddp=True,
+        ddp=False,
     )
 
 
@@ -354,24 +345,22 @@ class ResNetStudent(nn.Module):
 def train_student(teacher_path, dataset_mode, kd_method='logits',
                   epochs=30, lr=0.005, device='cuda', batch_size=64):
     
-    # Teacher (ResNet-50)
+    # 1. تنظیمات اولیه
     teacher = ResNetTeacher().to(device)
     ckpt = torch.load(teacher_path, map_location=device)
-    if isinstance(ckpt, dict):
-        state = ckpt.get('state_dict') or ckpt.get('model') or ckpt
-        teacher.model.load_state_dict(state, strict=False)
-    else:
-        teacher.model.load_state_dict(ckpt, strict=False)
-    
+    state = ckpt.get('state_dict') or ckpt.get('model') or ckpt
+    teacher.model.load_state_dict(state, strict=False)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
 
-    # Student (ResNet-20)
     student = ResNetStudent().to(device)
     optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.BCEWithLogitsLoss()
+    
+    # تعریف GradScaler برای Mixed Precision
+    scaler = GradScaler()
 
     # Dataset (توصیه: همه روی 200k)
     if dataset_mode == '140k':
@@ -398,45 +387,48 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
     for epoch in range(epochs):
         student.train()
         running_loss = 0.0
-        for i, (images, labels) in tqdm(enumerate(train_loader)):
+        
+        for i, (images, labels) in tqdm(enumerate(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
             images = images.to(device)
             labels = labels.to(device).float().unsqueeze(1)
 
-            with torch.no_grad():
-                teacher_logits, teacher_feats = teacher(images)
-            
-            student_logits, student_feats = student(images)
+            # استفاده از Mixed Precision در زمان Forward
+            with autocast():
+                with torch.no_grad():
+                    teacher_logits, teacher_feats = teacher(images)
+                
+                student_logits, student_feats = student(images)
+                
+                base_loss = criterion(student_logits, labels)
+                
+                # محاسبه Loss بر اساس متد انتخابی
+                if kd_method == 'logits':
+                    kd_loss = logits_loss(teacher_logits, student_logits, T=4.0)
+                    loss = 0.6 * base_loss + 0.4 * kd_loss
+                elif kd_method == 'at':
+                    kd_loss = at_loss(teacher_feats, student_feats)
+                    loss = base_loss + 0.4 * kd_loss
+                elif kd_method == 'rkd':
+                    t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
+                    s_emb = student.model.avgpool(student_feats[-1]).flatten(1)
+                    rkd_loss = RKDLoss().to(device)(t_emb, s_emb)
+                    loss = base_loss + 0.5 * rkd_loss
 
-            if epoch == 0 and i == 0:
-                print(f"\n--- Debugging Feature Dimensions ---")
-                print(f"Teacher feats shapes: {[f.shape for f in teacher_feats]}")
-                print(f"Student feats shapes: {[f.shape for f in student_feats]}")
-                print(f"-------------------------------------\n")
-            
-            base_loss = criterion(student_logits, labels)
-            
-            if kd_method == 'logits':
-                kd_loss = logits_loss(teacher_logits, student_logits, T=4.0)
-                loss = 0.6 * base_loss + 0.4 * kd_loss
-            elif kd_method == 'at':
-                kd_loss = at_loss(teacher_feats, student_feats)
-                loss = base_loss + 0.4 * kd_loss
-            elif kd_method == 'rkd':
-                t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1) if hasattr(teacher.model, 'avgpool') else teacher_feats[-1].mean([2,3]).flatten(1)
-                s_emb = student.model.avgpool(student_feats[-1]).flatten(1) if hasattr(student.model, 'avgpool') else student_feats[-1].mean([2,3]).flatten(1)
-                rkd_loss = RKDLoss().to(device)(t_emb, s_emb)
-                loss = base_loss + 0.5 * rkd_loss
-
+            # 3. بهینه‌سازی با Scaler
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # مقیاس‌بندی loss و انجام Backward
+            scaler.scale(loss).backward()
+            # استپ کردن optimizer ( scaler خودش unscale را انجام می‌دهد)
+            scaler.step(optimizer)
+            scaler.update()
+            
             running_loss += loss.item()
 
         scheduler.step()
         print(f"Epoch {epoch+1}/{epochs} | Loss: {running_loss/len(train_loader):.4f}")
 
-    torch.save(student.state_dict(), f"baseline_student_{dataset_mode}_{kd_method}.pth")
-    print(f"Saved: baseline_student_{dataset_mode}_{kd_method}.pth")
+    torch.save(student.state_dict(), f"student_{dataset_mode}_{kd_method}_amp.pth")
+    print(f"Model saved successfully.")
 
 # ====================== اجرا ======================
 import argparse
