@@ -255,7 +255,7 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[int(epochs*0.5), int(epochs*0.75)], gamma=0.1)
     criterion = nn.BCEWithLogitsLoss()
-    scaler = GradScaler('cuda')
+    scaler = GradScaler('cuda', enabled=False)
     rkd_criterion = RKDLoss().to(device) if kd_method == 'rkd' else None
 
     # لود داده ها
