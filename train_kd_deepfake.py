@@ -442,7 +442,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    train_student(teacher_path=args.path, 
-                  dataset_mode=args.mode, 
-                  kd_method=args.method, 
-                  device=device)
+    train_student(
+        teacher_path=args.path, 
+        dataset_mode=args.mode, 
+        kd_method=args.method, 
+        device=device
+    )
