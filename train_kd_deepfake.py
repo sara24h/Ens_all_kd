@@ -125,26 +125,9 @@ def logits_loss(teacher_logits, student_logits):
 def at_loss(teacher_features, student_features):
     loss = 0.0
     for t_feat, s_feat in zip(teacher_features, student_features):
-        # محاسبه Attention Map مطابق فرمول مقاله: میانگین مربعات در بعد کانال
-        # خروجی به شکل (Batch, H, W) خواهد بود
-        t_att = t_feat.pow(2).mean(1) 
-        s_att = s_feat.pow(2).mean(1)
-        
-        # اگر ابعاد مکانی (H, W) معلم و دانش‌آموز متفاوت بود، ابعاد دانش‌آموز را به معلم نزدیک میکنیم
-        if t_att.shape != s_att.shape:
-            s_att = F.interpolate(s_att.unsqueeze(1), size=t_att.shape[1:], mode='bilinear', align_corners=False).squeeze(1)
-        
-        # فلتن کردن برای تبدیل به وکتور و محاسبه نرم
-        t_att = t_att.view(t_att.size(0), -1)
-        s_att = s_att.view(s_att.size(0), -1)
-        
-        # نرمال سازی با L2 Norm مطابق فرمول مقاله
-        t_att = F.normalize(t_att, dim=1)
-        s_att = F.normalize(s_att, dim=1)
-        
-        # محاسبه MSE
+        t_att = F.normalize(t_feat.pow(2).mean(1).view(t_feat.size(0), -1), dim=1)
+        s_att = F.normalize(s_feat.pow(2).mean(1).view(s_feat.size(0), -1), dim=1)
         loss += F.mse_loss(s_att, t_att) # فرمول شماره 4
-        
     return loss
 
 class RKDLoss(nn.Module):
@@ -171,7 +154,6 @@ class ResNetTeacher(nn.Module):
         self.model.fc = nn.Linear(self.model.fc.in_features, 1)
         self.features = []
         def hook_fn(module, input, output): self.features.append(output)
-        # هوک روی لایه های 2، 3 و 4
         self.model.layer2[-1].register_forward_hook(hook_fn)
         self.model.layer3[-1].register_forward_hook(hook_fn)
         self.model.layer4[-1].register_forward_hook(hook_fn)
@@ -210,10 +192,9 @@ class ResNetStudent(nn.Module):
         self.model = ResNet20()
         self.features = []
         def hook_fn(module, input, output): self.features.append(output)
-        # اصلاح مهم: هوک باید روی لایه 2 و 3 باشد تا با معلم متناسب باشد
+        self.model.layer1.register_forward_hook(hook_fn)
         self.model.layer2.register_forward_hook(hook_fn)
         self.model.layer3.register_forward_hook(hook_fn)
-        # چون ResNet20 لایه 4 ندارد، از همین دو لایه استفاده میکنیم
     def forward(self, x):
         self.features.clear(); return self.model(x), self.features
 
@@ -226,24 +207,11 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
     
+    # آماده سازی معلم (بدون DDP)
     teacher = ResNetTeacher().to(device)
     ckpt = torch.load(teacher_path, map_location=device)
-
-    if 'state_dict' in ckpt:
-        state = ckpt['state_dict']
-    elif 'model' in ckpt:
-        state = ckpt['model']
-    else:
-        state = ckpt
-
-    new_state = {k.replace('model.', ''): v for k, v in state.items()}
-    
-    try:
-        teacher.model.load_state_dict(new_state, strict=True)
-    except RuntimeError as e:
-        print(f"[Rank {local_rank}] WARNING: Teacher weights mismatch! {e}")
-        teacher.model.load_state_dict(new_state, strict=False)
-        
+    state = ckpt.get('state_dict') or ckpt.get('model') or ckpt
+    teacher.model.load_state_dict(state, strict=False)
     teacher.eval()
     for p in teacher.parameters(): p.requires_grad = False
 
@@ -255,7 +223,7 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[int(epochs*0.5), int(epochs*0.75)], gamma=0.1)
     criterion = nn.BCEWithLogitsLoss()
-    scaler = GradScaler('cuda', enabled=False)
+    scaler = GradScaler('cuda')
     rkd_criterion = RKDLoss().to(device) if kd_method == 'rkd' else None
 
     # لود داده ها
@@ -270,22 +238,13 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
 
     if local_rank == 0: print(f"\n[Info] LR milestones at epochs: {int(epochs*0.5)} and {int(epochs*0.75)}")
 
-    # متغیر برای نگه داشتن نوار پیشرفت آخرین ایپوک
-    last_epoch_pbar = None
-
     # حلقه آموزش
     for epoch in range(epochs):
         student.train()
         if train_sampler is not None: train_sampler.set_epoch(epoch)
         
         running_loss, running_corrects, total_samples = 0.0, 0, 0
-        
-        # ذخیره نوار پیشرفت در متغیر (برای ایپوک آخر از پاک شدن جلوگیری می‌کند)
-        if local_rank == 0:
-            data_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=(epoch == epochs - 1))
-            last_epoch_pbar = data_iter
-        else:
-            data_iter = train_loader
+        data_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}") if local_rank == 0 else train_loader
         
         for i, (images, labels) in enumerate(data_iter):
             images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
@@ -294,21 +253,15 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                 with torch.no_grad():
                     teacher_logits, teacher_feats = teacher(images)
                 
-                student_outputs = student(images)
-                student_logits = student_outputs[0]
-                student_feats = student_outputs[1]
+                student_logits, student_feats = student(images)
+                base_loss = criterion(student_logits, labels)
                 
-                # خیلی مهم: تبدیل به float32 قبل از محاسبه لاس برای جلوگیری از nan
-                base_loss = criterion(student_logits.float(), labels)
-                
-                if kd_method == 'logits': 
-                    loss = base_loss + logits_loss(teacher_logits.float(), student_logits.float())
-                elif kd_method == 'at': 
-                    loss = base_loss + at_loss(teacher_feats, student_feats)
+                if kd_method == 'logits': loss = base_loss + logits_loss(teacher_logits, student_logits)
+                elif kd_method == 'at': loss = base_loss + at_loss(teacher_feats, student_feats.module.features)
                 elif kd_method == 'rkd':
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
-                    s_emb = student.module.model.avgpool(student_feats[-1]).flatten(1)
-                    loss = base_loss + rkd_criterion(t_emb.float(), s_emb.float())
+                    s_emb = student_feats[-1] if not isinstance(student_feats, list) else student.module.model.avgpool(student_feats[-1]).flatten(1)
+                    loss = base_loss + rkd_criterion(t_emb, s_emb)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -330,44 +283,37 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     # ==========================================
     # 5. محاسبه دقت تست و سیو مدل (فقط در GPU اصلی)
     # ==========================================
-    dist.barrier()
-    student.eval()
-
+        # ==========================================
+    # 5. محاسبه دقت تست و سیو مدل (فقط در GPU اصلی)
+    # ==========================================
     if local_rank == 0:
+        print("\n" + "="*50)
+        print("Evaluating on Test Set...")
+        
+        # بسیار مهم: خروج مدل از حالت DDP برای جلوگیری از انتظار برای GPU های دیگر
         raw_student_model = student.module 
+        raw_student_model.eval() 
+        
         test_corrects, test_total = 0, 0
         
-        # نوار پیشرفت تست (با رنگ سبز برای تمایز)
-        test_pbar = tqdm(ds.loader_test, desc="Evaluating Test", colour='green')
-        
         with torch.no_grad():
-            for images, labels in test_pbar:
+            for images, labels in tqdm(ds.loader_test, desc="Testing"):
                 images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
                 
+                # استفاده از مدل خام به جای student (که DDP است)
                 logits, _ = raw_student_model(images)
                 preds = (torch.sigmoid(logits) > 0.5).float()
                 test_corrects += (preds == labels).sum().item()
                 test_total += labels.size(0)
                 
-                # نمایش دقت در لحظه روی نوار پیشرفت تست
-                current_test_acc = (test_corrects / test_total) * 100
-                test_pbar.set_postfix({'Test Acc': f'{current_test_acc:.2f}%'})
-                
         test_acc = (test_corrects / test_total) * 100
-        
-        # اضافه کردن دقت نهایی تست به همان نوار پیشرفتی که از ایپوک آخر باقی مانده بود
-        if last_epoch_pbar is not None:
-            last_epoch_pbar.set_postfix({
-                'Loss': f'{running_loss/len(train_loader):.4f}', 
-                'Train Acc': f'{(running_corrects/total_samples)*100:.2f}%',
-                'Final Test Acc': f'{test_acc:.2f}%'
-            })
-            
-        # چاپ خط پایانی برای سیو مدل
-        print(f"\n==> Model saved successfully. (Final Test Accuracy: {test_acc:.2f}%)")
+        print(f"==> Final Test Accuracy (Single Student): {test_acc:.2f}%")
+        print("="*50 + "\n")
 
         # ذخیره state_dict مدل خام
         torch.save(raw_student_model.state_dict(), f"student_{dataset_mode}_{kd_method}_amp_ddp.pth")
+        print(f"Model saved successfully.")
+
 # ==========================================
 # 6. اجرا
 # ==========================================
