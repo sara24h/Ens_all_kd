@@ -10,6 +10,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 from sklearn.model_selection import train_test_split
+from torch.cuda.amp import GradScaler, autocast
 
 class FaceDataset(Dataset):
     def __init__(self, data_frame, root_dir, transform=None, img_column='images_id'):
@@ -174,42 +175,6 @@ class Dataset_selector:
         except Exception as e:
             print(f"Error in train loader: {e}")
 
-if __name__ == "__main__":
-
-    # Example for 140k Real and Fake Faces
-    dataset_140k = Dataset_selector(
-        dataset_mode='140k',
-        realfake140k_train_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/train.csv',
-        realfake140k_valid_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/valid.csv',
-        realfake140k_test_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/test.csv',
-        realfake140k_root_dir='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces',
-        train_batch_size=64,
-        eval_batch_size=64,
-        ddp=False,
-    )
-
-    # Example for 190k Real and Fake Faces
-    dataset_190k = Dataset_selector(
-        dataset_mode='190k',
-        realfake190k_root_dir='/kaggle/input/datasets/manjilkarki/deepfake-and-real-images/Dataset',
-        train_batch_size=64,
-        eval_batch_size=64,
-        ddp=False,
-    )
-
-    # Example for 200k Real and Fake Faces
-    dataset_200k = Dataset_selector(
-        dataset_mode='200k',
-        realfake200k_train_csv='/kaggle/input/undersampled-200k/balanced_unique_200k_dataset/train_labels.csv',
-        realfake200k_val_csv='/kaggle/input/undersampled-200k/balanced_unique_200k_dataset/val_labels.csv',
-        realfake200k_test_csv='/kaggle/input/undersampled-200k/balanced_unique_200k_dataset/test_labels.csv',
-        realfake200k_root_dir='/kaggle/input/undersampled-200k/balanced_unique_200k_dataset',
-        train_batch_size=64,
-        eval_batch_size=64,
-        ddp=False,
-    )
-
-
 # ====================== KD Losses ======================
 def logits_loss(teacher_logits, student_logits, T=4.0):
     teacher_prob = torch.sigmoid(teacher_logits / T)
@@ -263,6 +228,8 @@ class ResNetTeacher(nn.Module):
         self.model.layer2[-1].register_forward_hook(hook_fn)
         self.model.layer3[-1].register_forward_hook(hook_fn)
         self.model.layer4[-1].register_forward_hook(hook_fn)
+        # در __init__ کلاس ResNetTeacher:
+        self.model.eval() # اضافه کردن این خط
 
     def forward(self, x):
         self.features.clear()
@@ -378,6 +345,7 @@ def train_student(teacher_path, dataset_mode, kd_method='logits',
         ds = Dataset_selector(dataset_mode='200k',
                               realfake200k_val_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/val_labels.csv',
                               realfake200k_test_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/test_labels.csv',
+                              realfake200k_train_csv='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset/train_labels.csv'
                               realfake200k_root_dir='/kaggle/input/datasets/saraaskari/undersampled-200k/balanced_unique_200k_dataset',
                               realfake190k_root_dir='/kaggle/input/datasets/manjilkarki/deepfake-and-real-images/Dataset',
                               train_batch_size=batch_size, eval_batch_size=64, ddp=False)
