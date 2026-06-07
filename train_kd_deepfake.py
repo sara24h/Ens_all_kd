@@ -300,44 +300,33 @@ def evaluate_validation(student, val_loader, device):
 def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                   epochs=200, lr=0.1, momentum=0.9, weight_decay=0.0005, batch_size=64,
                   alpha=1.0, beta=1.0):
-    # alpha: وزن Student Loss (L_S) — مطابق مقاله
-    # beta:  وزن Distilled Loss (L_logits) — مطابق مقاله
-    # نکته: برای AT و RKD مقاله α=1 فرض کرده (جمع ساده)،
-    #        اما برای logits ضرایب α و β صریحاً در معادله ۳ ذکر شده‌اند.
     
     torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
-    
+   
+    # ==================== Teacher & Student Setup ====================
     teacher = ResNetTeacher().to(device)
     ckpt = torch.load(teacher_path, map_location=device)
     state = ckpt.get('state_dict') or ckpt.get('model') or ckpt
     teacher.model.load_state_dict(state, strict=False)
     teacher.eval()
-    for p in teacher.parameters(): p.requires_grad = False
+    for p in teacher.parameters():
+        p.requires_grad = False
 
     student = ResNetStudent().to(device)
     student = DDP(student, device_ids=[local_rank])
 
-    optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True)
+    optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=momentum,
+                                weight_decay=weight_decay, nesterov=True)
     
-    if epochs > 10:
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[int(epochs*0.5), int(epochs*0.75)], gamma=0.1)
-        if local_rank == 0: print(f"\n[Info] LR milestones at epochs: {int(epochs*0.5)} and {int(epochs*0.75)}")
-    else:
-        scheduler = None
-        if local_rank == 0: print(f"\n[Info] Epochs <= 10, Scheduler disabled to prevent LR crash.")
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                     milestones=[int(epochs*0.5), int(epochs*0.75)],
+                                                     gamma=0.1) if epochs > 10 else None
 
     criterion = nn.BCEWithLogitsLoss()
-    
-    scaler = GradScaler(
-        device='cuda',
-        init_scale=1024,
-        growth_factor=2.0,
-        backoff_factor=0.25,
-        growth_interval=2000
-    )
-    
-    rkd_criterion = RKDLoss().to(device) if kd_method == 'rkd' else None
+    scaler = GradScaler(device='cuda', init_scale=1024)
+
+    rkd_criterion = RKDLoss(dist_weight=1.0, angle_weight=2.0).to(device) if kd_method == 'rkd' else None
 
     if dataset_mode == '140k':
         ds = Dataset_selector(dataset_mode='140k', realfake140k_train_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/train.csv', realfake140k_valid_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/valid.csv', realfake140k_test_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/test.csv', realfake140k_root_dir='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces', train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
@@ -346,49 +335,49 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
     elif dataset_mode == '200k':
         ds = Dataset_selector(dataset_mode='200k', realfake200k_val_csv='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset/val_labels.csv', realfake200k_test_csv='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset/test_labels.csv', realfake200k_train_csv='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset/train_labels.csv', realfake200k_root_dir='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset', train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
                               
-    train_loader, train_sampler = ds.loader_train, ds.train_sampler
+    train_loader = ds.loader_train
+    train_sampler = ds.train_sampler
 
     if local_rank == 0:
         print(f"[Info] KD Method: {kd_method}")
         if kd_method == 'logits':
-            print(f"[Info] Loss = {alpha} * L_student + {beta} * L_logits  (Eq.3)")
+            print(f"[Info] Loss = {alpha} * L_student + {beta} * L_logits")
 
     for epoch in range(epochs):
         student.train()
-        if train_sampler is not None: train_sampler.set_epoch(epoch)
-        
-        running_loss, running_corrects, total_samples = 0.0, 0, 0
-        data_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}") if local_rank == 0 else train_loader
-        
-        for i, (images, labels) in enumerate(data_iter):
-            images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
-            with autocast(device_type='cuda', dtype=torch.float16): 
+        running_loss = running_corrects = total_samples = 0.0
+        data_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}") if local_rank == 0 else train_loader
+
+        for images, labels in data_iter:
+            images = images.to(device)
+            labels = labels.to(device).float().unsqueeze(1)
+
+            with autocast(device_type='cuda', dtype=torch.float16):
                 with torch.no_grad():
                     teacher_logits, teacher_feats = teacher(images)
-                
+
                 student_logits, student_feats = student(images)
                 base_loss = criterion(student_logits, labels)
-                
-                # ---- محاسبه Loss مطابق فرمول‌های مقاله ----
+
                 if kd_method == 'logits':
-                    # معادله ۳: L = α * L_S + β * L_logits
                     loss = alpha * base_loss + beta * logits_loss(teacher_logits, student_logits)
                 elif kd_method == 'at':
-                    # معادله ۵: L = L_S + L_AT  (بدون α/β در مقاله)
                     loss = base_loss + at_loss(teacher_feats, student_feats)
                 elif kd_method == 'rkd':
-                    # معادله ۸: L = L_S + L_RKD  (بدون α/β در مقاله)
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
-                    s_emb = student_feats[-1] if not isinstance(student_feats, list) else student.module.model.avgpool(student_feats[-1]).flatten(1)
+                    s_feat = student_feats[-1] if isinstance(student_feats, list) else student_feats
+                    s_emb = student.module.model.avgpool(s_feat).flatten(1)
                     loss = base_loss + rkd_criterion(t_emb, s_emb)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            scaler.step(optimizer)
+            scaler.step(optimizer)      # اول optimizer.step()
             scaler.update()
-            
+
             running_loss += loss.item()
             with torch.no_grad():
                 preds = (torch.sigmoid(student_logits) > 0.5).float()
@@ -396,12 +385,19 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                 total_samples += labels.size(0)
 
             if local_rank == 0:
-                data_iter.set_postfix({'Loss': f'{running_loss/(i+1):.4f}', 'Acc': f'{(running_corrects/total_samples)*100:.2f}%', 'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'})
+                data_iter.set_postfix({
+                    'Loss': f'{running_loss/(len(data_iter)):.4f}',
+                    'Acc': f'{(running_corrects/total_samples)*100:.2f}%',
+                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                })
 
+        # Scheduler بعد از optimizer.step() فراخوانی شود
         if scheduler is not None:
             scheduler.step()
+
+        # ====================== Validation ======================
         val_acc = evaluate_validation(student, ds.loader_val, device)
-        
+
         if local_rank == 0:
             train_acc = (running_corrects / total_samples * 100) if total_samples > 0 else 0.0
             print(f"Epoch {epoch+1:3d}/{epochs} | "
@@ -409,44 +405,37 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                   f"Train Acc: {train_acc:.2f}% | "
                   f"Val Acc: {val_acc:.2f}%")
 
-    # ==========================================
-    # 5. Test Evaluation
-    # ==========================================
+    # ====================== Final Test ======================
+    if local_rank == 0:
+        print("\nTraining finished. Running final test...")
+
     student.eval()
-    test_corrects = 0
-    test_total = 0
-    
+    test_corrects = test_total = 0
     with torch.no_grad():
-        test_iter = tqdm(ds.loader_test, desc="Evaluating Test Set") if local_rank == 0 else ds.loader_test
-        
+        test_iter = tqdm(ds.loader_test, desc="Final Test") if local_rank == 0 else ds.loader_test
         for images, labels in test_iter:
-            images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
-            
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True).view(-1, 1)
             with autocast(device_type='cuda', dtype=torch.float16):
                 logits, _ = student(images)
                 preds = (torch.sigmoid(logits) > 0.5).float()
-                
             test_corrects += (preds == labels).sum().item()
             test_total += labels.size(0)
 
     if dist.is_initialized():
-        tensor_corrects = torch.tensor(test_corrects, dtype=torch.float64, device=device)
-        tensor_total = torch.tensor(test_total, dtype=torch.float64, device=device)
-        
-        dist.all_reduce(tensor_corrects, op=dist.ReduceOp.SUM)
-        dist.all_reduce(tensor_total, op=dist.ReduceOp.SUM)
-        
-        test_corrects = tensor_corrects.item()
-        test_total = tensor_total.item()
+        tc = torch.tensor(test_corrects, dtype=torch.float64, device=device)
+        tt = torch.tensor(test_total, dtype=torch.float64, device=device)
+        dist.all_reduce(tc, op=dist.ReduceOp.SUM)
+        dist.all_reduce(tt, op=dist.ReduceOp.SUM)
+        test_corrects, test_total = tc.item(), tt.item()
 
     if local_rank == 0:
-        test_acc = (test_corrects / test_total) * 100
-        print("\n" + "="*50)
-        print(f"==> Final Test Accuracy: {test_acc:.2f}%")
-        print("="*50 + "\n")
-
-        torch.save(student.module.state_dict(), f"student_{dataset_mode}_{kd_method}_amp_ddp.pth")
-        print(f"Model saved successfully.")
+        test_acc = (test_corrects / test_total * 100) if test_total > 0 else 0.0
+        print("\n" + "="*70)
+        print(f"FINAL TEST ACCURACY: {test_acc:.2f}%")
+        print("="*70)
+        torch.save(student.module.state_dict(), f"student_{dataset_mode}_{kd_method}_final.pth")
+        print(f"Model saved: student_{dataset_mode}_{kd_method}_final.pth")
 
 # ==========================================
 # 6. Exec
