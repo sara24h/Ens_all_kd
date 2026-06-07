@@ -368,20 +368,13 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                     loss = alpha * base_loss + beta * logits_loss(teacher_logits, student_logits)
                 elif kd_method == 'at':
                     loss = base_loss + at_loss(teacher_feats, student_feats)
-                                elif kd_method == 'rkd':
-                    # استفاده از Adapter برای همسان‌سازی ابعاد (پیشنهادی)
-                    # اگر ابعاد تفاوت دارد، ابتدا معلم را به بُعد دانشجو پروجکت می‌کنیم
-                    # اما فعلاً فرض می‌کنیم یا ابعاد را درست کردیم یا با GAP هماهنگ است.
-                    
-                    # اصلاح مهم: اضافه کردن ضریب وزنی (Gamma)
-                    # تحلیل شما نشان داد RKD گرادیان Base را خفه می‌کند.
+                elif kd_method == 'rkd':
+            
                     gamma_rkd = 0.05  # مقدار شروع کوچک (مثلا 0.05 یا 0.1)
                     
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
                     s_feat = student_feats[-1] if isinstance(student_feats, list) else student_feats
                     s_emb = student.module.model.avgpool(s_feat).flatten(1)
-                    
-                    # اضافه کردن وزن
                     loss = base_loss + gamma_rkd * rkd_criterion(t_emb, s_emb)
 
             optimizer.zero_grad()
