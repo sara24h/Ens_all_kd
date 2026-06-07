@@ -250,11 +250,17 @@ class ResNet20(nn.Module):
 
     def forward(self, x):
         x = self.relu(self.bn1(self.conv1(x)))
-        x = self.layer1(x)
+        
+        # اجرا برای فعال‌سازی هوک‌ها
+        x = self.layer1(x) 
         x = self.layer2(x)
         x = self.layer3(x)
+        
+        # Pooling و Flatten
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
+        
+        # برگرداندن خروجی نهایی
         return self.fc(x)
 
 class ResNetStudent(nn.Module):
