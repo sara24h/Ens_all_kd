@@ -31,7 +31,7 @@ warnings.filterwarnings("ignore")
 #   └── this_script.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dynamic_hesitant.datasets.base_dataset import create_dataloaders_ddp
+from base_dataset import create_dataloaders_ddp
 
 
 # ==========================================
