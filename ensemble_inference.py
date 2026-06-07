@@ -19,7 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. Dataset & Models (از کد اول)
+# 1. Models (ResNet20 & Wrapper)
 # ==========================================
 
 class ResNet20(nn.Module):
@@ -56,17 +56,19 @@ class ResNet20(nn.Module):
 class ResNetKD(nn.Module):
     def __init__(self, arch='resnet20'):
         super().__init__()
-        # ما فرض می‌کنیم تمام مدل‌های دانشجو ResNet20 هستند
         if arch == 'resnet20':
             self.model = ResNet20()
         else:
-            # اگر لازم بود ResNet50 هم اضافه شود
             from torchvision.models import resnet50
             self.model = resnet50(pretrained=False)
             self.model.fc = nn.Linear(self.model.fc.in_features, 1)
 
     def forward(self, x):
         return self.model(x)
+
+# ==========================================
+# 2. Dataset (Simple & Generic for New Data)
+# ==========================================
 
 class FaceDataset(Dataset):
     def __init__(self, data_frame, root_dir, transform=None, img_column='images_id'):
@@ -80,12 +82,21 @@ class FaceDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        img_name = os.path.join(self.root_dir, self.data[self.img_column].iloc[idx])
+        # هندل کردن مسیر فایل
+        path_in_csv = self.data[self.img_column].iloc[idx]
+        
+        # اگر مسیر کامل نیست به root_dir اضافه کن
+        if not os.path.isabs(path_in_csv):
+            img_name = os.path.join(self.root_dir, path_in_csv)
+        else:
+            img_name = path_in_csv
+            
         if not os.path.exists(img_name):
-            # اگر عکس پیدا نشد، یک عکس سیاه ایجاد می‌کنیم تا کرش نکند (یا خطا بدهید)
-            # اینجا برای اطمینان از اجرا، هندل ساده می‌کنیم
+            # اگر عکس پیدا نشد (برای جلوگیری از کرش)
             image = Image.new('RGB', (256, 256))
             label = 0
+            if dist.get_rank() == 0:
+                print(f"Warning: Image not found {img_name}, using dummy.")
         else:
             image = Image.open(img_name).convert('RGB')
             label = self.label_map[str(self.data['label'].iloc[idx]).lower()]
@@ -94,113 +105,54 @@ class FaceDataset(Dataset):
             image = self.transform(image)
         return image, torch.tensor(label, dtype=torch.float)
 
-class Dataset_selector:
-    def __init__(self, dataset_mode, realfake140k_train_csv=None, realfake140k_valid_csv=None, 
-                 realfake140k_test_csv=None, realfake140k_root_dir=None, realfake200k_train_csv=None, 
-                 realfake200k_val_csv=None, realfake200k_test_csv=None, realfake200k_root_dir=None, 
-                 realfake190k_root_dir=None, train_batch_size=32, eval_batch_size=32, num_workers=4, 
-                 pin_memory=True, ddp=False, rank=0, world_size=1):
-        
-        if dataset_mode not in ['140k', '190k', '200k']:
-            raise ValueError("dataset_mode must be '140k', '190k', '200k'")
-        self.dataset_mode = dataset_mode
-        image_size = (256, 256)
-
-        # تعریف Mean/Std بر اساس دیتاست
-        if dataset_mode == '140k':
-            mean, std = (0.5207, 0.4258, 0.3806), (0.2490, 0.2239, 0.2212)
-        elif dataset_mode == '200k':
-            mean, std = (0.4460, 0.3622, 0.3416), (0.2057, 0.1849, 0.1761)
-        elif dataset_mode == '190k':
-            mean, std = (0.4668, 0.3816, 0.3414), (0.2410, 0.2161, 0.2081)
-
-        # Transform تست (بدون آگمنتیشن)
-        transform_test = transforms.Compose([
-            transforms.Resize(image_size), 
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
-        ])
-
-        img_column = 'path' if dataset_mode == '140k' else 'images_id'
-        root_dir = train_data = val_data = test_data = None
-
-        # لود دیتافریم‌ها بر اساس مد
-        if dataset_mode == '140k':
-            if not all([realfake140k_test_csv, realfake140k_root_dir]): 
-                raise ValueError("140k test paths missing")
-            test_data = pd.read_csv(realfake140k_test_csv)
-            root_dir = os.path.join(realfake140k_root_dir, 'real_vs_fake', 'real-vs-fake')
-
-        elif dataset_mode == '200k':
-            if not all([realfake200k_test_csv, realfake200k_root_dir]): 
-                raise ValueError("200k test paths missing")
-            test_data = pd.read_csv(realfake200k_test_csv)
-            root_dir = realfake200k_root_dir
-            def create_image_path(row):
-                folder = 'real' if str(row['label']).lower() in ['1', 'real'] else 'fake'
-                # تلاش برای پیدا کردن نام فایل
-                img_name = row.get('filename_clean', row.get('filename', row.get('image', row.get('path', ''))))
-                return os.path.join('test', folder, os.path.basename(img_name))
-            test_data['images_id'] = test_data.apply(lambda r: create_image_path(r), axis=1)
-
-        elif dataset_mode == '190k':
-            if not realfake190k_root_dir: raise ValueError("190k path missing")
-            root_dir = realfake190k_root_dir
-            def collect_images(split):
-                data = []
-                for label in ['Real', 'Fake']:
-                    folder_path = os.path.join(root_dir, split, label)
-                    if os.path.exists(folder_path):
-                        for img_name in os.listdir(folder_path):
-                            if img_name.endswith(('.jpg', '.jpeg', '.png')):
-                                data.append({'images_id': os.path.join(split, label, img_name), 'label': label})
-                return pd.DataFrame(data)
-            test_data = collect_images('Test')
-
-        # ساخت دیتاست تست
-        test_dataset = FaceDataset(test_data, root_dir, transform=transform_test, img_column=img_column)
-        
-        # ساخت لودر تست (بدون شافل)
-        # نکته: در اینجا sampler را بیرون از کلاس می‌سازیم تا کنترل DDP دست ما باشد
-        self.test_dataset = test_dataset
-        self.loader_test = DataLoader(test_dataset, batch_size=eval_batch_size, shuffle=False, 
-                                      num_workers=num_workers, pin_memory=pin_memory)
-        if rank == 0: print(f"Test Dataset loaded: {len(test_dataset)} samples.")
-
 # ==========================================
-# 2. Ensemble Class (گسترش یافته)
+# 3. Ensemble Class (با Normalize اختصاصی)
 # ==========================================
+
+class MultiModelNormalization(nn.Module):
+    """کلاس نرمال‌ساز مشابه کد Fuzzy Hesitant"""
+    def __init__(self, means, stds):
+        super().__init__()
+        for i, (m, s) in enumerate(zip(means, stds)):
+            self.register_buffer(f'mean_{i}', torch.tensor(m).view(1, 3, 1, 1))
+            self.register_buffer(f'std_{i}', torch.tensor(s).view(1, 3, 1, 1))
+
+    def forward(self, x, idx):
+        return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 class DeepfakeEnsemble:
-    def __init__(self, model_paths, device):
+    def __init__(self, model_paths, device, means, stds):
         self.device = device
         self.models = []
+        
+        # شیء نرمال‌سازی مشترک برای همه مدل‌ها
+        self.normalization = MultiModelNormalization(means, stds).to(device)
         
         for i, path in enumerate(model_paths):
             model = ResNetKD(arch='resnet20').to(self.device)
             if os.path.exists(path):
                 ckpt = torch.load(path, map_location=self.device)
-                # هندل کردن فرمت‌های مختلف ذخیره‌سازی
                 state = ckpt.get('state_dict') or ckpt.get('model') or ckpt.get('model_state_dict')
-                # اگر کلیدها شامل 'model.' هستند و مدل ResNetKD است که خودش self.model دارد
-                # معمولا state_dict دانشجو با ResNetKD سازگار است
                 model.load_state_dict(state, strict=False)
                 model.eval()
                 self.models.append(model)
                 if dist.get_rank() == 0:
-                    print(f"Model {i+1} loaded from: {path}")
+                    print(f"Model {i+1} loaded: {path}")
             else:
                 if dist.get_rank() == 0:
                     print(f"Warning: Model path not found: {path}")
     
     def predict(self, images):
-        """Soft Voting"""
+        """Soft Voting با نرمال‌سازی اختصاصی"""
         images = images.to(self.device)
         probs = []
         
         with torch.no_grad():
-            for model in self.models:
-                logits = model(images)              
+            for i, model in enumerate(self.models):
+                # نرمال‌سازی مخصوص مدل i ام
+                norm_images = self.normalization(images, i)
+                
+                logits = model(norm_images)              
                 prob = torch.sigmoid(logits)        
                 probs.append(prob)
         
@@ -239,8 +191,8 @@ class DeepfakeEnsemble:
             metrics = {'acc': acc, 'auc': auc, 'f1': f1, 'prec': prec, 'rec': rec}
         return metrics
 
-    def evaluate_single_model(self, model, dataloader, model_name="Single Model"):
-        """ارزیابی یک مدل خاص"""
+    def evaluate_single_model(self, model, dataloader, model_index, model_name="Single Model"):
+        """ارزیابی یک مدل خاص با Normalize اختصاصی"""
         if dist.get_rank() == 0:
             print(f"\nEvaluating {model_name}...")
             
@@ -251,7 +203,11 @@ class DeepfakeEnsemble:
             data_iter = tqdm(dataloader, desc=f"Eval {model_name}") if dist.get_rank() == 0 else dataloader
             for images, labels in data_iter:
                 images = images.to(self.device)
-                logits = model(images)
+                
+                # نرمال‌سازی با ایندکس مدل
+                norm_images = self.normalization(images, model_index)
+                
+                logits = model(norm_images)
                 probs = torch.sigmoid(logits)
                 
                 all_probs.append(probs.cpu().numpy().flatten())
@@ -274,7 +230,7 @@ class DeepfakeEnsemble:
             data_iter = tqdm(dataloader, desc=f"Eval {dataset_name}") if dist.get_rank() == 0 else dataloader
             
             for images, labels in data_iter:
-                probs, _ = self.predict(images) # پیش‌بینی انسمبل
+                probs, _ = self.predict(images)
                 
                 all_probs.append(probs.cpu().numpy().flatten())
                 all_labels.append(labels.numpy().flatten())
@@ -287,24 +243,20 @@ class DeepfakeEnsemble:
 
 # ====================== اجرا ======================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate Ensemble & Single Models")
+    parser = argparse.ArgumentParser(description="Evaluate Ensemble & Single Models on NEW Dataset")
 
-    # تنظیمات دیتاست
-    parser.add_argument("--dataset_mode", type=str, default="200k", choices=["140k", "190k", "200k"])
+    # تنظیمات دیتاست جدید
+    parser.add_argument("--test_csv", type=str, required=True, help="Path to NEW test CSV")
+    parser.add_argument("--root_dir", type=str, required=True, help="Root directory of NEW images")
     parser.add_argument("--batch_size", type=int, default=64)
     
-    # مسیر فایل‌های تست
-    # برای هر مد باید مسیر تست مربوط به همان را بدهید
-    parser.add_argument("--test_csv", type=str, default="", help="Path to test CSV")
-    parser.add_argument("--root_dir", type=str, default="", help="Root directory of images")
-
-    # مسیر مدل‌های آموزش داده شده (Student models)
+    # مسیر مدل‌های آموزش داده شده
     parser.add_argument("--models", type=str, nargs='+', required=True, help="Paths to .pth files")
-
+    
     args = parser.parse_args()
 
     # 1. مقداردهی اولیه Distributed
-    dist.init_process_group(backend="nccl") # برای چند GPU در یک سیستم nccl بهتر است
+    dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
@@ -312,28 +264,47 @@ if __name__ == "__main__":
 
     if dist.get_rank() == 0:
         print("="*70)
-        print("ENSEMBLE & SINGLE MODEL EVALUATION")
+        print("ENSEMBLE & SINGLE MODEL EVALUATION (NEW DATASET)")
         print("="*70)
-        print(f"Dataset Mode: {args.dataset_mode}")
-        print(f"Models to evaluate: {len(args.models)}")
-        print(f"GPU World Size: {world_size}")
+        print(f"Test CSV: {args.test_csv}")
+        print(f"Root Dir: {args.root_dir}")
+        print(f"Models: {len(args.models)}")
         print("="*70)
 
-    # 2. لود دیتاست
-    # برای سادگی، مسیرهای CSV و Root را بر اساس dataset_mode نگاشت می‌کنیم
-    # اگر args.dataset_mode با فایلی که دارید متفاوت است، اینجا باید دستی مسیر دهید
-    ds = Dataset_selector(
-        dataset_mode=args.dataset_mode,
-        realfake140k_test_csv=args.test_csv if args.dataset_mode == '140k' else None,
-        realfake140k_root_dir=args.root_dir if args.dataset_mode == '140k' else None,
-        realfake200k_test_csv=args.test_csv if args.dataset_mode == '200k' else None,
-        realfake200k_root_dir=args.root_dir if args.dataset_mode == '200k' else None,
-        realfake190k_root_dir=args.root_dir if args.dataset_mode == '190k' else None,
-        eval_batch_size=args.batch_size,
-        ddp=False 
-    )
+    # 2. آماده‌سازی Mean/Std (طبق استاندارد مدل‌های شما)
+    # اگر مدل‌های شما Mean/Std متفاوتی دارند، این لیست را تغییر دهید
+    DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
+    DEFAULT_STDS  = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+    
+    num_models = len(args.models)
+    if num_models > len(DEFAULT_MEANS):
+        MEANS = DEFAULT_MEANS + [DEFAULT_MEANS[-1]] * (num_models - len(DEFAULT_MEANS))
+        STDS = DEFAULT_STDS + [DEFAULT_STDS[-1]] * (num_models - len(DEFAULT_STDS))
+    else:
+        MEANS = DEFAULT_MEANS[:num_models]
+        STDS = DEFAULT_STDS[:num_models]
 
-    test_dataset = ds.test_dataset
+    if dist.get_rank() == 0:
+        print(f"Using Normalization Stats for {num_models} models.")
+
+    # 3. لود دیتاست (بدون Normalize، تبدیل خام به Tensor)
+    transform_test = transforms.Compose([
+        transforms.Resize((256, 256)), 
+        transforms.ToTensor()
+        # Normalize حذف شد
+    ])
+    
+    test_data = pd.read_csv(args.test_csv)
+    
+    # تشخیص نام ستون عکس (اختیاری)
+    img_col = 'images_id'
+    if img_col not in test_data.columns:
+        if 'path' in test_data.columns: img_col = 'path'
+        elif 'filename' in test_data.columns: img_col = 'filename'
+        else: img_col = test_data.columns[0] # ستون اول
+
+    test_dataset = FaceDataset(test_data, args.root_dir, transform=transform_test, img_column=img_col)
+    
     test_sampler = DistributedSampler(
         test_dataset, 
         num_replicas=world_size, 
@@ -349,12 +320,17 @@ if __name__ == "__main__":
         pin_memory=True
     )
 
-    # 3. ساخت Ensemble (لود مدل‌ها)
-    ensemble = DeepfakeEnsemble(args.models, device=device)
+    # 4. ساخت Ensemble با Mean/Std ها
+    ensemble = DeepfakeEnsemble(
+        args.models, 
+        device=device, 
+        means=MEANS, 
+        stds=STDS
+    )
 
-    # 4. ارزیابی مدل‌های تکی
+    # 5. ارزیابی مدل‌های تکی
     single_models_metrics = []
-    dist.barrier() # همگام‌سازی
+    dist.barrier()
 
     if dist.get_rank() == 0:
         print("\n" + "="*30)
@@ -368,6 +344,7 @@ if __name__ == "__main__":
         metrics = ensemble.evaluate_single_model(
             model, 
             distributed_test_loader, 
+            model_index=i,
             model_name=model_name
         )
         
@@ -378,7 +355,7 @@ if __name__ == "__main__":
                 'metrics': metrics
             })
 
-    # 5. نمایش بهترین مدل تکی
+    # 6. نمایش بهترین مدل تکی
     if dist.get_rank() == 0:
         if single_models_metrics:
             best_model_info = max(single_models_metrics, key=lambda x: x['metrics']['auc'])
@@ -388,11 +365,11 @@ if __name__ == "__main__":
             print(f"Accuracy: {best_model_info['metrics']['acc']:.4f}")
             print("="*30 + "\n")
 
-    # 6. ارزیابی نهایی انسمبل
+    # 7. ارزیابی نهایی انسمبل
     dist.barrier()
     ensemble.evaluate_ensemble(
         distributed_test_loader,
-        dataset_name=f"Ensemble ({args.dataset_mode})"
+        dataset_name="Ensemble (New Dataset)"
     )
 
     dist.destroy_process_group()
