@@ -16,13 +16,156 @@ import sys
 # ---- Distributed Imports ----
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
+from torchvision import datasets  # اضافه شده
 
 warnings.filterwarnings("ignore")
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ==========================================
+# 0. مستقل‌سازی لودر دیتاست (جایگزین base_dataset.py)
+# ==========================================
 
-import base_dataset
-from base_dataset import create_dataloaders_ddp
+def worker_init_fn(worker_id):
+    np.random.seed(42 + worker_id)
+
+def create_reproducible_split(dataset, seed=42, train_ratio=0.7, val_ratio=0.15):
+    num_samples = len(dataset)
+    indices = np.arange(num_samples)
+    np.random.seed(seed)
+    np.random.shuffle(indices)
+    
+    train_end = int(train_ratio * num_samples)
+    val_end = train_end + int(val_ratio * num_samples)
+    
+    train_indices = indices[:train_end]
+    val_indices = indices[train_end:val_end]
+    test_indices = indices[val_end:]
+    
+    return train_indices, val_indices, test_indices
+
+class TransformSubset(Dataset):
+    def __init__(self, dataset, indices, transform=None):
+        self.dataset = dataset
+        self.indices = indices
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+        img, label = self.dataset[real_idx]
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+def create_dataloaders_ddp(base_dir: str, batch_size: int, rank: int, world_size: int,
+                          num_workers: int = 2, dataset_type: str = 'wild'):
+    """نسخه مستقل و اصلاح شده برای اجرا در Kaggle"""
+    
+    if rank == 0:
+        print("="*70)
+        print(f"Creating DataLoaders (Standalone Version) | Dataset: {dataset_type}")
+        print("="*70)
+   
+    train_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.RandomCrop(256),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(0.2, 0.2),
+        transforms.ToTensor(),
+    ])
+   
+    val_test_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(256),
+        transforms.ToTensor(),
+    ])
+   
+    # --- حالت 1: Wild (پوشه های train, val, test جداگانه) ---
+    if dataset_type == 'wild':
+        splits_map = {'train': 'train', 'valid': 'valid', 'test': 'test'}
+        # اگر valid نبود val را چک کن
+        if not os.path.exists(os.path.join(base_dir, 'valid')):
+            splits_map['valid'] = 'val'
+            
+        loaders = {}
+        for split_key, split_folder in splits_map.items():
+            path = os.path.join(base_dir, split_folder)
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Folder not found: {path}")
+            
+            if rank == 0:
+                print(f"Loading {split_key.upper()}: {path}")
+
+            transform = train_transform if split_key == 'train' else val_test_transform
+            dataset = datasets.ImageFolder(path, transform=transform)
+            
+            if split_key == 'train':
+                sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+                loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                                  num_workers=num_workers, pin_memory=True, drop_last=True,
+                                  worker_init_fn=worker_init_fn)
+            else:
+                loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                                  num_workers=num_workers, pin_memory=True, drop_last=False,
+                                  worker_init_fn=worker_init_fn)
+            loaders[split_key] = loader
+        
+        return loaders['train'], loaders['valid'], loaders['test']
+
+    # --- حالت 2: Real_Fake / Hard_Fake / DeepFlux (یک پوشه با دو زیرپوشه) ---
+    elif dataset_type in ['real_fake', 'hard_fake_real', 'deepflux', 'uadfV']:
+        if rank == 0:
+            print(f"Processing {dataset_type} from: {base_dir}")
+        
+        # هوشمند در پیدا کردن پوشه دیتاست
+        dataset_dir = base_dir
+        possible_subdirs = ['real_and_fake_face', 'hardfakevsrealfaces', 'DeepFLUX', 'UADFV']
+        found = False
+        
+        # چک می‌کنیم آیا خود base_dir دارای پوشه real/fake است؟
+        if os.path.exists(os.path.join(base_dir, 'real')) or os.path.exists(os.path.join(base_dir, 'fake')):
+             found = True
+        else:
+            # اگر نه، دنبال زیرپوشه‌های استاندارد می‌گردیم
+            for subdir in possible_subdirs:
+                if os.path.exists(os.path.join(base_dir, subdir)):
+                    dataset_dir = os.path.join(base_dir, subdir)
+                    found = True
+                    break
+        
+        if not found:
+            # اگر باز هم پیدا نشد، فرض می‌کنیم خود base_dir دیتاست است
+            pass
+
+        full_dataset = datasets.ImageFolder(dataset_dir)
+        if rank == 0:
+            print(f"Classes found: {full_dataset.classes}")
+            print(f"Total images: {len(full_dataset)}")
+
+        train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=42)
+        
+        train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
+        val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
+        test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
+        
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler,
+                                 num_workers=num_workers, pin_memory=True, drop_last=True,
+                                 worker_init_fn=worker_init_fn)
+        
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                               num_workers=num_workers, pin_memory=True, drop_last=False,
+                               worker_init_fn=worker_init_fn)
+        
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                                num_workers=num_workers, pin_memory=True, drop_last=False,
+                                worker_init_fn=worker_init_fn)
+        
+        return train_loader, val_loader, test_loader
+    else:
+        raise ValueError(f"Unknown dataset_type: {dataset_type}")
 
 
 # ==========================================
@@ -66,7 +209,6 @@ class ResNetKD(nn.Module):
         if arch == 'resnet20':
             self.model = ResNet20()
         else:
-            # اگر مدل‌های شما ResNet50 هستند اینجا تغییر دهید
             from torchvision.models import resnet50
             self.model = resnet50(pretrained=False)
             self.model.fc = nn.Linear(self.model.fc.in_features, 1)
@@ -79,7 +221,6 @@ class ResNetKD(nn.Module):
 # ==========================================
 
 class MultiModelNormalization(nn.Module):
-    """کلاس نرمال‌ساز مشابه کد Fuzzy Hesitant"""
     def __init__(self, means, stds):
         super().__init__()
         for i, (m, s) in enumerate(zip(means, stds)):
@@ -93,15 +234,10 @@ class DeepfakeEnsemble:
     def __init__(self, model_paths, device, means, stds):
         self.device = device
         self.models = []
-        
-        # شیء نرمال‌سازی مشترک برای همه مدل‌ها
         self.normalization = MultiModelNormalization(means, stds).to(device)
         
         for i, path in enumerate(model_paths):
-            # هندل کردن آرگومان arch اگر لازم باشد
-            # اینجا فرض می‌کنیم همه مدل‌ها ResNet20 هستند. اگر نیستند مسیر را چک کنید.
             model = ResNetKD(arch='resnet20').to(self.device)
-            
             if os.path.exists(path):
                 ckpt = torch.load(path, map_location=self.device)
                 state = ckpt.get('state_dict') or ckpt.get('model') or ckpt.get('model_state_dict')
@@ -115,29 +251,21 @@ class DeepfakeEnsemble:
                     print(f"Warning: Model path not found: {path}")
     
     def predict(self, images):
-        """Soft Voting با نرمال‌سازی اختصاصی"""
         images = images.to(self.device)
         probs = []
-        
         with torch.no_grad():
             for i, model in enumerate(self.models):
-                # نرمال‌سازی مخصوص مدل i ام
                 norm_images = self.normalization(images, i)
-                
                 logits = model(norm_images)              
                 prob = torch.sigmoid(logits)        
                 probs.append(prob)
-        
         ensemble_prob = torch.mean(torch.stack(probs), dim=0)
         ensemble_pred = (ensemble_prob > 0.5).float()
-        
         return ensemble_prob, ensemble_pred
 
     def _gather_and_compute_metrics(self, local_probs, local_labels, dataset_name="Model"):
-        """جمع‌آوری نتایج از تمام GPUها و محاسبه معیارها"""
         gathered_probs = [None for _ in range(dist.get_world_size())]
         gathered_labels = [None for _ in range(dist.get_world_size())]
-        
         dist.all_gather_object(gathered_probs, local_probs)
         dist.all_gather_object(gathered_labels, local_labels)
 
@@ -159,77 +287,59 @@ class DeepfakeEnsemble:
             print(f"Precision : {prec:.4f}")
             print(f"Recall    : {rec:.4f}")
             print(f"F1-Score  : {f1:.4f}")
-            
             metrics = {'acc': acc, 'auc': auc, 'f1': f1, 'prec': prec, 'rec': rec}
         return metrics
 
     def evaluate_single_model(self, model, dataloader, model_index, model_name="Single Model"):
-        """ارزیابی یک مدل خاص با Normalize اختصاصی"""
         if dist.get_rank() == 0:
             print(f"\nEvaluating {model_name}...")
-            
         all_probs = []
         all_labels = []
-        
         with torch.no_grad():
             data_iter = tqdm(dataloader, desc=f"Eval {model_name}") if dist.get_rank() == 0 else dataloader
             for images, labels in data_iter:
                 images = images.to(self.device)
-                
-                # نرمال‌سازی با ایندکس مدل
                 norm_images = self.normalization(images, model_index)
-                
                 logits = model(norm_images)
                 probs = torch.sigmoid(logits)
-                
                 all_probs.append(probs.cpu().numpy().flatten())
                 all_labels.append(labels.numpy().flatten())
         
         local_probs = np.concatenate(all_probs)
         local_labels = np.concatenate(all_labels)
-        
         return self._gather_and_compute_metrics(local_probs, local_labels, dataset_name=model_name)
 
     def evaluate_ensemble(self, dataloader, dataset_name="Ensemble"):
-        """ارزیابی انسمبل"""
         all_probs = []
         all_labels = []
-        
         if dist.get_rank() == 0:
             print(f"\nEvaluating {dataset_name} (Distributed)...")
-            
         with torch.no_grad():
             data_iter = tqdm(dataloader, desc=f"Eval {dataset_name}") if dist.get_rank() == 0 else dataloader
-            
             for images, labels in data_iter:
                 probs, _ = self.predict(images)
-                
                 all_probs.append(probs.cpu().numpy().flatten())
                 all_labels.append(labels.numpy().flatten())
         
         local_probs = np.concatenate(all_probs)
         local_labels = np.concatenate(all_labels)
-
         return self._gather_and_compute_metrics(local_probs, local_labels, dataset_name=dataset_name)
 
 
 # ====================== اجرا ======================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate Ensemble & Single Models on NEW Dataset (using base_dataset.py)")
+    parser = argparse.ArgumentParser(description="Evaluate Ensemble & Single Models (Standalone)")
 
-    # تنظیمات دیتاست جدید (تغییر یافته: حذف CSV و اضافه شدن data_dir و dataset_type)
     parser.add_argument("--data_dir", type=str, required=True, help="Root directory of NEW dataset")
     parser.add_argument("--dataset_type", type=str, required=True, 
                         choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV'],
-                        help="Type of dataset structure (defined in base_dataset.py)")
+                        help="Type of dataset structure")
     parser.add_argument("--batch_size", type=int, default=64)
-    
-    # مسیر مدل‌های آموزش داده شده
     parser.add_argument("--models", type=str, nargs='+', required=True, help="Paths to .pth files")
     
     args = parser.parse_args()
 
-    # 1. مقداردهی اولیه Distributed
+    # 1. Distributed Init
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -239,14 +349,14 @@ if __name__ == "__main__":
 
     if rank == 0:
         print("="*70)
-        print("ENSEMBLE & SINGLE MODEL EVALUATION (USING BASE_DATASET)")
+        print("ENSEMBLE & SINGLE MODEL EVALUATION (STANDALONE - NO IMPORT ERRORS)")
         print("="*70)
         print(f"Data Dir: {args.data_dir}")
         print(f"Dataset Type: {args.dataset_type}")
         print(f"Models: {len(args.models)}")
         print("="*70)
 
-    # 2. آماده‌سازی Mean/Std (طبق استاندارد مدل‌های شما)
+    # 2. Mean/Std
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS  = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
@@ -261,38 +371,32 @@ if __name__ == "__main__":
     if rank == 0:
         print(f"Using Normalization Stats for {num_models} models.")
 
-    # 3. لود دیتاست با استفاده از base_dataset.py
-    # این تابع 3 خروجی دارد: train, val, test. ما فقط test را می‌خواهیم.
-    # نکته: create_dataloaders_ddp نیاز به rank و world_size دارد.
+    # 3. لود دیتاست (بدون ارور ایمپورت)
     try:
         _, _, distributed_test_loader = create_dataloaders_ddp(
             base_dir=args.data_dir,
             batch_size=args.batch_size,
             rank=rank,
             world_size=world_size,
-            num_workers=4,  # تنظیم کنید
+            num_workers=4,
             dataset_type=args.dataset_type
         )
         if rank == 0:
-            print(f"Dataset loaded successfully. Test batches: {len(distributed_test_loader)}")
+            print(f"Dataset loaded successfully.")
     except Exception as e:
         if rank == 0:
-            print(f"Error loading dataset via base_dataset.py: {e}")
+            print(f"Error loading dataset: {e}")
+            import traceback
+            traceback.print_exc()
         dist.destroy_process_group()
         sys.exit(1)
 
-    # 4. ساخت Ensemble با Mean/Std ها
-    ensemble = DeepfakeEnsemble(
-        args.models, 
-        device=device, 
-        means=MEANS, 
-        stds=STDS
-    )
+    # 4. ساخت Ensemble
+    ensemble = DeepfakeEnsemble(args.models, device=device, means=MEANS, stds=STDS)
 
-    # 5. ارزیابی مدل‌های تکی
+    # 5. ارزیابی تک به تک
     single_models_metrics = []
     dist.barrier()
-
     if rank == 0:
         print("\n" + "="*30)
         print("Starting Single Model Evaluation")
@@ -301,36 +405,21 @@ if __name__ == "__main__":
     for i, model in enumerate(ensemble.models):
         dist.barrier()
         model_name = f"Model {i+1} ({os.path.basename(args.models[i])})"
-        
-        metrics = ensemble.evaluate_single_model(
-            model, 
-            distributed_test_loader, 
-            model_index=i,
-            model_name=model_name
-        )
-        
+        metrics = ensemble.evaluate_single_model(model, distributed_test_loader, model_index=i, model_name=model_name)
         if rank == 0:
-            single_models_metrics.append({
-                'index': i,
-                'name': model_name,
-                'metrics': metrics
-            })
+            single_models_metrics.append({'index': i, 'name': model_name, 'metrics': metrics})
 
-    # 6. نمایش بهترین مدل تکی
+    # 6. بهترین مدل
     if rank == 0:
         if single_models_metrics:
             best_model_info = max(single_models_metrics, key=lambda x: x['metrics']['auc'])
             print("\n" + "="*30)
             print(f"BEST SINGLE MODEL: {best_model_info['name']}")
             print(f"AUC: {best_model_info['metrics']['auc']:.4f}")
-            print(f"Accuracy: {best_model_info['metrics']['acc']:.4f}")
             print("="*30 + "\n")
 
-    # 7. ارزیابی نهایی انسمبل
+    # 7. انسمبل
     dist.barrier()
-    ensemble.evaluate_ensemble(
-        distributed_test_loader,
-        dataset_name="Ensemble (New Dataset)"
-    )
+    ensemble.evaluate_ensemble(distributed_test_loader, dataset_name="Ensemble (New Dataset)")
 
     dist.destroy_process_group()
