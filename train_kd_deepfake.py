@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 # ==========================================
-# 1. Dataset & DataLoader (بدون تغییر)
+# 1. Dataset & DataLoader
 # ==========================================
 class FaceDataset(Dataset):
     def __init__(self, data_frame, root_dir, transform=None, img_column='images_id'):
@@ -31,8 +31,11 @@ class FaceDataset(Dataset):
     def __getitem__(self, idx):
         img_name = os.path.join(self.root_dir, self.data[self.img_column].iloc[idx])
         if not os.path.exists(img_name):
-            raise FileNotFoundError(f"image not found: {img_name}")
-        image = Image.open(img_name).convert('RGB')
+            # جلوگیری از کرش کردن در صورت نبود عکس (برای دیتاست‌های بزرگ توصیه می‌شود)
+            image = Image.new('RGB', (256, 256))
+        else:
+            image = Image.open(img_name).convert('RGB')
+            
         label = self.label_map[self.data['label'].iloc[idx]]
         if self.transform:
             image = self.transform(image)
@@ -46,7 +49,7 @@ class Dataset_selector:
                  pin_memory=True, ddp=False, rank=0, world_size=1):
         
         if dataset_mode not in ['140k', '190k', '200k']:
-            raise ValueError("dataset_mode must be  '140k', '190k', '200k'")
+            raise ValueError("dataset_mode must be '140k', '190k', '200k'")
         self.dataset_mode = dataset_mode
         image_size = (256, 256)
 
@@ -85,7 +88,9 @@ class Dataset_selector:
                 folder = 'real' if row['label'] in [1, 'real', 'Real'] else 'fake'
                 img_name = os.path.basename(row.get('filename_clean', row.get('filename', row.get('image', row.get('path', '')))))
                 return os.path.join(split, folder, img_name)
-            train_data['images_id'], val_data['images_id'], test_data['images_id'] = train_data.apply(lambda r: create_image_path(r, 'train'), axis=1), val_data.apply(lambda r: create_image_path(r, 'val'), axis=1), test_data.apply(lambda r: create_image_path(r, 'test'), axis=1)
+            train_data['images_id'] = train_data.apply(lambda r: create_image_path(r, 'train'), axis=1)
+            val_data['images_id'] = val_data.apply(lambda r: create_image_path(r, 'val'), axis=1)
+            test_data['images_id'] = test_data.apply(lambda r: create_image_path(r, 'test'), axis=1)
 
         elif dataset_mode == '190k':
             if not realfake190k_root_dir: raise ValueError("190k path missing")
@@ -94,13 +99,19 @@ class Dataset_selector:
                 data = []
                 for label in ['Real', 'Fake']:
                     folder_path = os.path.join(root_dir, split, label)
-                    if not os.path.exists(folder_path): raise FileNotFoundError(f"Folder not found: {folder_path}")
+                    if not os.path.exists(folder_path):
+                        continue
                     for img_name in os.listdir(folder_path):
-                        if img_name.endswith(('.jpg', '.jpeg', '.png')): data.append({'images_id': os.path.join(split, label, img_name), 'label': label})
+                        if img_name.endswith(('.jpg', '.jpeg', '.png')): 
+                            data.append({'images_id': os.path.join(split, label, img_name), 'label': label})
                 return pd.DataFrame(data)
-            train_data, val_data, test_data = collect_images_from_folder('Train').sample(frac=1).reset_index(drop=True), collect_images_from_folder('Validation').sample(frac=1).reset_index(drop=True), collect_images_from_folder('Test').sample(frac=1).reset_index(drop=True)
+            train_data = collect_images_from_folder('Train').sample(frac=1).reset_index(drop=True)
+            val_data = collect_images_from_folder('Validation').sample(frac=1).reset_index(drop=True)
+            test_data = collect_images_from_folder('Test').sample(frac=1).reset_index(drop=True)
 
-        train_dataset, val_dataset, test_dataset = FaceDataset(train_data, root_dir, transform=transform_train, img_column=img_column), FaceDataset(val_data, root_dir, transform=transform_test, img_column=img_column), FaceDataset(test_data, root_dir, transform=transform_test, img_column=img_column)
+        train_dataset = FaceDataset(train_data, root_dir, transform=transform_train, img_column=img_column)
+        val_dataset = FaceDataset(val_data, root_dir, transform=transform_test, img_column=img_column)
+        test_dataset = FaceDataset(test_data, root_dir, transform=transform_test, img_column=img_column)
 
         self.train_sampler = None
         shuffle_train = True
@@ -114,69 +125,24 @@ class Dataset_selector:
         if rank == 0: print(f"DataLoaders ready - Train: {len(self.loader_train)}, Val: {len(self.loader_val)}, Test: {len(self.loader_test)}")
 
 # ==========================================
-# 2. KD Losses (اصلاح شده مطابق مقاله)
+# 2. KD Losses
 # ==========================================
 
 def logits_loss(teacher_logits, student_logits):
     return F.mse_loss(teacher_logits, student_logits)
 
-# ==========================================
-# 2-1. AT Loss (اصلاح شده مطابق فرمول ۴ مقاله)
-# ==========================================
-# فرمول مقاله (معادله ۴):
-#   L_AT = Σ_j || Q_S^j / ||Q_S^j||_2  -  Q_T^j / ||Q_T^j||_2 ||_2^2
-#
-# مراحل:
-#   1. محاسبه Attention Map: Q = Σ(F^2) over channels → vectorize → [B, H*W]
-#   2. نرمال‌سازی L2 هر بردار: Q_hat = Q / ||Q||_2
-#   3. محاسبه فاصله: ||Q_S_hat - Q_T_hat||_2^2
-# ==========================================
-
 def at_loss(teacher_features, student_features):
     loss = 0.0
-    
     for t_feat, s_feat in zip(teacher_features, student_features):
-        # گام ۱: محاسبه Attention Map (Sum of Squared Activations over channels)
-        # مقاله: Q = vec(Σ_c F_c^2) → شکل: [Batch, H*W]
-        t_att = t_feat.pow(2).sum(1).view(t_feat.size(0), -1)  # [B, H_T * W_T]
-        s_att = s_feat.pow(2).sum(1).view(s_feat.size(0), -1)  # [B, H_S * W_S]
-        
-        # تغییر سایز Attention Map دانشجو برای تطبیق با ابعاد معلم
+        t_att = t_feat.pow(2).sum(1).view(t_feat.size(0), -1)
+        s_att = s_feat.pow(2).sum(1).view(s_feat.size(0), -1)
         target_size = t_att.shape[1]
         if s_att.shape[1] != target_size:
             s_att = F.adaptive_avg_pool1d(s_att.unsqueeze(1), target_size).squeeze(1)
-            
-        # گام ۲: نرمال‌سازی L2 هر بردار توجه: Q / ||Q||_2
         t_att = F.normalize(t_att, p=2, dim=1)
         s_att = F.normalize(s_att, p=2, dim=1)
-        
-        # گام ۳: محاسبه || Q_S_hat - Q_T_hat ||_2^2
-        # ||v||_2^2 = Σ v_i^2 → sum over spatial, then mean over batch
         loss += (s_att - t_att).pow(2).sum(1).mean()
-        
     return loss
-
-# ==========================================
-# 2-2. RKD Loss (اصلاح شده مطابق فرمول ۶-۷ مقاله و مقاله اصلی Park et al.)
-# ==========================================
-# فرمول مقاله (معادله ۶):
-#   L_RKD = Σ_{(x1,...,xn)∈χ_N} l_δ(φ(f_T(x1),...,f_T(xn)), φ(f_S(x1),...,f_S(xn)))
-#
-# Distance-wise (χ₂ — جفت‌ها):
-#   d_ij = ||h_i - h_j||_2    (فاصله اقلیدسی خام)
-#   d̂_ij = d_ij / d̄          (نرمال‌سازی با میانگین فاصله بچ)
-#   لس = l_δ(d̂^T, d̂^S)
-#
-# Angle-wise (χ₃ — سه‌تایی‌ها):
-#   e_ij = (h_i - h_j) / ||h_i - h_j||_2   (بردار واحد از j به i)
-#   θ_ijk = arccos(e_ij · e_kj)             (زاویه در نقطه j بین i→j و k→j)
-#   لس = l_δ(θ^T, θ^S)
-#
-# l_δ = Huber Loss (معادله ۷):
-#   l_δ(x, y) = 0.5(x-y)²         اگر |x-y| < 1
-#   l_δ(x, y) = |x-y| - 0.5      در غیر این صورت
-#   (معادل F.smooth_l1_loss با delta=1)
-# ==========================================
 
 class RKDLoss(nn.Module):
     def __init__(self, dist_weight=1.0, angle_weight=2.0, eps=1e-8):
@@ -209,8 +175,9 @@ class RKDLoss(nn.Module):
         return angle
 
 # ==========================================
-# 3. Models (بدون تغییر)
+# 3. Models
 # ==========================================
+
 class ResNetTeacher(nn.Module):
     def __init__(self):
         super().__init__()
@@ -221,58 +188,88 @@ class ResNetTeacher(nn.Module):
         self.model.layer2[-1].register_forward_hook(hook_fn)
         self.model.layer3[-1].register_forward_hook(hook_fn)
         self.model.layer4[-1].register_forward_hook(hook_fn)
-        self.model.eval()
+        
     def forward(self, x):
-        self.features.clear(); return self.model(x), self.features
+        self.features.clear()
+        return self.model(x), self.features
 
-def conv3x3(in_planes, out_planes, stride=1): return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+def conv3x3(in_planes, out_planes, stride=1): 
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
 
 class BasicBlock(nn.Module):
     def __init__(self, inplanes, planes, stride=1):
         super().__init__()
-        self.conv1, self.bn1, self.relu = conv3x3(inplanes, planes, stride), nn.BatchNorm2d(planes), nn.ReLU(inplace=True)
-        self.conv2, self.bn2 = conv3x3(planes, planes), nn.BatchNorm2d(planes)
-        self.downsample = nn.Sequential(nn.Conv2d(inplanes, planes, kernel_size=1, stride=stride, bias=False), nn.BatchNorm2d(planes)) if stride != 1 or inplanes != planes else None
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(inplanes, planes, kernel_size=1, stride=stride, bias=False),
+            nn.BatchNorm2d(planes)
+        ) if stride != 1 or inplanes != planes else None
+
     def forward(self, x):
         identity = self.downsample(x) if self.downsample is not None else x
-        return self.relu(self.bn2(self.conv2(self.relu(self.bn1(self.conv1(x))))) + identity)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.relu(out + identity)
 
 class ResNet20(nn.Module):
     def __init__(self):
         super().__init__()
         self.inplanes = 16
-        self.conv1, self.bn1, self.relu = conv3x3(3, 16), nn.BatchNorm2d(16), nn.ReLU(inplace=True)
-        self.layer1 = nn.Sequential(BasicBlock(16, 16), BasicBlock(16, 16), BasicBlock(16, 16))
-        self.layer2 = nn.Sequential(BasicBlock(16, 32, 2), BasicBlock(32, 32), BasicBlock(32, 32))
-        self.layer3 = nn.Sequential(BasicBlock(32, 64, 2), BasicBlock(64, 64), BasicBlock(64, 64))
-        self.avgpool, self.fc = nn.AdaptiveAvgPool2d((1, 1)), nn.Linear(64, 1)
+        self.conv1 = conv3x3(3, 16)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.relu = nn.ReLU(inplace=True)
+        
+        self.layer1 = self._make_layer(16, 16, 3)
+        self.layer2 = self._make_layer(16, 32, 3, stride=2)
+        self.layer3 = self._make_layer(32, 64, 3, stride=2)
+        
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(64, 1)
+        
+        self.feat1 = None
+        self.feat2 = None
+        self.feat3 = None
+        
+        def hook1(m, i, o): self.feat1 = o
+        def hook2(m, i, o): self.feat2 = o
+        def hook3(m, i, o): self.feat3 = o
+        
+        self.layer1[-1].register_forward_hook(hook1)
+        self.layer2[-1].register_forward_hook(hook2)
+        self.layer3[-1].register_forward_hook(hook3)
+
+    def _make_layer(self, inplanes, planes, blocks, stride=1):
+        layers = []
+        layers.append(BasicBlock(inplanes, planes, stride))
+        for _ in range(1, blocks):
+            layers.append(BasicBlock(planes, planes))
+        return nn.Sequential(*layers)
+
     def forward(self, x):
-        x = self.relu(self.bn1(self.conv1(x))); x = self.layer1(x); feat2 = self.layer2(x); feat3 = self.layer3(feat2)
-        return self.fc(self.avgpool(feat3).view(feat3.size(0), -1))
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        return self.fc(x)
 
 class ResNetStudent(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = ResNet20()
-        self.features = []
-        def hook_fn(module, input, output): self.features.append(output)
-        self.model.layer1.register_forward_hook(hook_fn)
-        self.model.layer2.register_forward_hook(hook_fn)
-        self.model.layer3.register_forward_hook(hook_fn)
+
     def forward(self, x):
-        self.features.clear(); return self.model(x), self.features
+        logits = self.model(x)
+        feats = [self.model.feat1, self.model.feat2, self.model.feat3]
+        return logits, feats
 
 # ==========================================
-# 4. Training Function (اصلاح شده با α و β مطابق معادله ۳ مقاله)
-# ==========================================
-# مقاله (معادله ۳):
-#   L_Total_logits = α * L_S(y, z_s) + β * L_logits(z_t, z_s)
-#
-# مقاله (معادله ۵):
-#   L_Total_AT = L_S(y, z_s) + L_AT(Q_T, Q_S)
-#
-# مقاله (معادله ۸):
-#   L_Total_RKD = L_S(y, z_s) + L_RKD(t, s)
+# 4. Training Function
 # ==========================================
 def evaluate_validation(student, val_loader, device):
     student.eval()
@@ -324,7 +321,7 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                                                      gamma=0.1) if epochs > 10 else None
 
     criterion = nn.BCEWithLogitsLoss()
-    scaler = GradScaler(device='cuda', init_scale=1024)
+    scaler = GradScaler()
 
     rkd_criterion = RKDLoss(dist_weight=1.0, angle_weight=2.0).to(device) if kd_method == 'rkd' else None
 
@@ -367,15 +364,20 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                 elif kd_method == 'at':
                     loss = base_loss + at_loss(teacher_feats, student_feats)
                 elif kd_method == 'rkd':
+                    # برای RKD، از آخرین لایه معلم و دانشجو استفاده می‌کنیم (Layer 4 & Layer 3)
+                    # Teacher: Layer 4 features (Output of layer4[-1] hook)
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
+                    
+                    # Student: Layer 3 features (Output of layer3 hook)
                     s_feat = student_feats[-1] if isinstance(student_feats, list) else student_feats
                     s_emb = student.module.model.avgpool(s_feat).flatten(1)
+                    
                     loss = base_loss + rkd_criterion(t_emb, s_emb)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            scaler.step(optimizer)      # اول optimizer.step()
+            scaler.step(optimizer)
             scaler.update()
 
             running_loss += loss.item()
@@ -391,7 +393,7 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                     'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
                 })
 
-        # Scheduler بعد از optimizer.step() فراخوانی شود
+        # **اصلاحیه مهم**: فراخوانی scheduler بعد از optimizer.step
         if scheduler is not None:
             scheduler.step()
 
@@ -438,11 +440,11 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
         print(f"Model saved: student_{dataset_mode}_{kd_method}_final.pth")
 
 # ==========================================
-# 6. Exec
+# 5. Main Execution
 # ==========================================
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="KD Training with DDP")
+    parser = argparse.ArgumentParser(description="KD Training with DDP (Gloo)")
     parser.add_argument('--mode', type=str, required=True, help="140k, 190k, or 200k")
     parser.add_argument('--method', type=str, required=True, help="logits, at, or rkd")
     parser.add_argument('--path', type=str, required=True, help="Path to teacher pth")
@@ -454,7 +456,9 @@ if __name__ == "__main__":
     parser.add_argument('--beta', type=float, default=1.0, help="Weight for distilled loss (Eq.3)")
     args = parser.parse_args()
     
+    # تنظیم بک‌اند به صورت صریح برای Gloo
     dist.init_process_group(backend="gloo") 
+    
     local_rank = int(os.environ["LOCAL_RANK"])
     
     train_student(
