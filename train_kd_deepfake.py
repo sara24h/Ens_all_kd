@@ -277,6 +277,142 @@ class ResNetStudent(nn.Module):
     def forward(self, x):
         self.features.clear(); return self.model(x), self.features
 
+def evaluate_validation(student, val_loader, device):
+    student.eval()
+    val_corrects = 0
+    val_total = 0
+    
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
+            with autocast(device_type='cuda', dtype=torch.float16):
+                logits, _ = student(images)
+                preds = (torch.sigmoid(logits) > 0.5).float()
+            
+            val_corrects += (preds == labels).sum().item()
+            val_total += labels.size(0)
+            
+    # پشتیبانی از DDP برای تجمیع داده‌ها از تمام پردازنده‌ها/کارت‌ها
+    if dist.is_initialized():
+        tensor_corrects = torch.tensor(val_corrects, dtype=torch.float64, device=device)
+        tensor_total = torch.tensor(val_total, dtype=torch.float64, device=device)
+        dist.all_reduce(tensor_corrects, op=dist.ReduceOp.SUM)
+        dist.all_reduce(tensor_total, op=dist.ReduceOp.SUM)
+        val_corrects = tensor_corrects.item()
+        val_total = tensor_total.item()
+        
+    return (val_corrects / val_total) * 100 if val_total > 0 else 0.0
+
+
+# ==========================================
+# 5. Training Function (اصلاح شده برای مانیتورینگ ولیدیشن)
+# ==========================================
+def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
+                  epochs=200, lr=0.1, momentum=0.9, weight_decay=0.0005, batch_size=64,
+                  alpha=1.0, beta=1.0):
+    
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f'cuda:{local_rank}')
+    
+    teacher = ResNetTeacher().to(device)
+    ckpt = torch.load(teacher_path, map_location=device)
+    state = ckpt.get('state_dict') or ckpt.get('model') or ckpt
+    teacher.model.load_state_dict(state, strict=False)
+    teacher.eval()
+    for p in teacher.parameters(): p.requires_grad = False
+
+    student = ResNetStudent().to(device)
+    student = DDP(student, device_ids=[local_rank])
+
+    optimizer = torch.optim.SGD(student.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True)
+    
+    if epochs > 10:
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[int(epochs*0.5), int(epochs*0.75)], gamma=0.1)
+        if local_rank == 0: print(f"\n[Info] LR milestones at epochs: {int(epochs*0.5)} and {int(epochs*0.75)}")
+    else:
+        scheduler = None
+        if local_rank == 0: print(f"\n[Info] Epochs <= 10, Scheduler disabled to prevent LR crash.")
+
+    criterion = nn.BCEWithLogitsLoss()
+    
+    scaler = GradScaler(
+        device='cuda',
+        init_scale=1024,
+        growth_factor=2.0,
+        backoff_factor=0.25,
+        growth_interval=2000
+    )
+    
+    rkd_criterion = RKDLoss().to(device) if kd_method == 'rkd' else None
+
+    if dataset_mode == '140k':
+        ds = Dataset_selector(dataset_mode='140k', realfake140k_train_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/train.csv', realfake140k_valid_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/valid.csv', realfake140k_test_csv='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces/test.csv', realfake140k_root_dir='/kaggle/input/datasets/xhlulu/140k-real-and-fake-faces', train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
+    elif dataset_mode == '190k':
+        ds = Dataset_selector(dataset_mode='190k', realfake190k_root_dir='/kaggle/input/datasets/manjilkarki/deepfake-and-real-images/Dataset', train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
+    elif dataset_mode == '200k':
+        ds = Dataset_selector(dataset_mode='200k', realfake200k_val_csv='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset/val_labels.csv', realfake200k_test_csv='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset/test_labels.csv', realfake200k_train_csv='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset/train_labels.csv', realfake200k_root_dir='/kaggle/input/datasets/sarahemmat/undersampled-200k/balanced_unique_200k_dataset', train_batch_size=batch_size, eval_batch_size=64, ddp=True, rank=local_rank, world_size=dist.get_world_size())
+                            
+    train_loader, train_sampler = ds.loader_train, ds.train_sampler
+
+    if local_rank == 0:
+        print(f"[Info] KD Method: {kd_method}")
+        if kd_method == 'logits':
+            print(f"[Info] Loss = {alpha} * L_student + {beta} * L_logits  (Eq.3)")
+
+    for epoch in range(epochs):
+        student.train()
+        if train_sampler is not None: train_sampler.set_epoch(epoch)
+        
+        running_loss, running_corrects, total_samples = 0.0, 0, 0
+        data_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}") if local_rank == 0 else train_loader
+        
+        for i, (images, labels) in enumerate(data_iter):
+            images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
+
+            with autocast(device_type='cuda', dtype=torch.float16): 
+                with torch.no_grad():
+                    teacher_logits, teacher_feats = teacher(images)
+                
+                student_logits, student_feats = student(images)
+                base_loss = criterion(student_logits, labels)
+                
+                if kd_method == 'logits':
+                    loss = alpha * base_loss + beta * logits_loss(teacher_logits, student_logits)
+                elif kd_method == 'at':
+                    loss = base_loss + at_loss(teacher_feats, student_feats)
+                elif kd_method == 'rkd':
+                    t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
+                    s_emb = student_feats[-1] if not isinstance(student_feats, list) else student.module.model.avgpool(student_feats[-1]).flatten(1)
+                    loss = base_loss + rkd_criterion(t_emb, s_emb)
+
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            scaler.step(optimizer)
+            scaler.update()
+            
+            running_loss += loss.item()
+            with torch.no_grad():
+                preds = (torch.sigmoid(student_logits) > 0.5).float()
+                running_corrects += (preds == labels).sum().item()
+                total_samples += labels.size(0)
+
+            if local_rank == 0:
+                data_iter.set_postfix({
+                    'Loss': f'{running_loss/(i+1):.4f}', 
+                    'Acc': f'{(running_corrects/total_samples)*100:.2f}%', 
+                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                })
+
+        if scheduler is not None:
+            scheduler.step()
+            
+        # محاسبه دقت ولیدیشن در انتهای هر اپوک
+        val_acc = evaluate_validation(student, ds.loader_val, device)
+        
+        if local_rank == 0: 
+            print(f"Epoch {epoch+1}/{epochs} | Loss: {running_loss/len(train_loader):.4f} | Train Acc: {(running_corrects/total_samples)*100:.2f}% | Val Acc: {val_acc:.2f}%")
+            
 # ==========================================
 # 4. Training Function (اصلاح شده با α و β مطابق معادله ۳ مقاله)
 # ==========================================
