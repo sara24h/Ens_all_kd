@@ -19,18 +19,9 @@ from torch.utils.data.distributed import DistributedSampler
 
 warnings.filterwarnings("ignore")
 
-# ==========================================
-# 0. ایمپورت تنظیمات دیتاست (base_dataset.py)
-# ==========================================
-# توجه: برای اینکه این ایمپورت کار کند، فایل base_dataset.py باید در مسیر پروژه باشد.
-# ساختار پوشه معمولاً به این صورت است:
-# project_root/
-#   ├── dynamic_hesitant/
-#   │   └── datasets/
-#   │       └── base_dataset.py
-#   └── this_script.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import base_dataset
 from base_dataset import create_dataloaders_ddp
 
 
