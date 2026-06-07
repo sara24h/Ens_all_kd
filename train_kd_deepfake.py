@@ -391,7 +391,7 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
 
         # ========== پایان حلقه آموزش ==========
         # دستور زیر باید اینجا باشد (خارج از حلقه for بالا)
-        if scheduler is not None:
+        if scheduler is not None and epoch > 0:
             scheduler.step()
 
         # ====================== Validation ======================
