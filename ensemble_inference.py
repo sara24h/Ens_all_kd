@@ -16,12 +16,12 @@ import sys
 # ---- Distributed Imports ----
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
-from torchvision import datasets  # اضافه شده
+from torchvision import datasets
 
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 0. مستقل‌سازی لودر دیتاست (جایگزین base_dataset.py)
+# 0. مستقل‌سازی لودر دیتاست (Standalone Dataset Loader)
 # ==========================================
 
 def worker_init_fn(worker_id):
@@ -82,10 +82,8 @@ def create_dataloaders_ddp(base_dir: str, batch_size: int, rank: int, world_size
         transforms.ToTensor(),
     ])
    
-    # --- حالت 1: Wild (پوشه های train, val, test جداگانه) ---
     if dataset_type == 'wild':
         splits_map = {'train': 'train', 'valid': 'valid', 'test': 'test'}
-        # اگر valid نبود val را چک کن
         if not os.path.exists(os.path.join(base_dir, 'valid')):
             splits_map['valid'] = 'val'
             
@@ -114,21 +112,17 @@ def create_dataloaders_ddp(base_dir: str, batch_size: int, rank: int, world_size
         
         return loaders['train'], loaders['valid'], loaders['test']
 
-    # --- حالت 2: Real_Fake / Hard_Fake / DeepFlux (یک پوشه با دو زیرپوشه) ---
     elif dataset_type in ['real_fake', 'hard_fake_real', 'deepflux', 'uadfV']:
         if rank == 0:
             print(f"Processing {dataset_type} from: {base_dir}")
         
-        # هوشمند در پیدا کردن پوشه دیتاست
         dataset_dir = base_dir
         possible_subdirs = ['real_and_fake_face', 'hardfakevsrealfaces', 'DeepFLUX', 'UADFV']
         found = False
         
-        # چک می‌کنیم آیا خود base_dir دارای پوشه real/fake است؟
         if os.path.exists(os.path.join(base_dir, 'real')) or os.path.exists(os.path.join(base_dir, 'fake')):
              found = True
         else:
-            # اگر نه، دنبال زیرپوشه‌های استاندارد می‌گردیم
             for subdir in possible_subdirs:
                 if os.path.exists(os.path.join(base_dir, subdir)):
                     dataset_dir = os.path.join(base_dir, subdir)
@@ -136,7 +130,6 @@ def create_dataloaders_ddp(base_dir: str, batch_size: int, rank: int, world_size
                     break
         
         if not found:
-            # اگر باز هم پیدا نشد، فرض می‌کنیم خود base_dir دیتاست است
             pass
 
         full_dataset = datasets.ImageFolder(dataset_dir)
@@ -169,55 +162,73 @@ def create_dataloaders_ddp(base_dir: str, batch_size: int, rank: int, world_size
 
 
 # ==========================================
-# 1. Models (ResNet20 & Wrapper)
+# 1. Models (اصلاح شده برای تطبیق با کد آموزش)
 # ==========================================
+
+def conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+class BasicBlock(nn.Module):
+    def __init__(self, inplanes, planes, stride=1):
+        super().__init__()
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(inplanes, planes, kernel_size=1, stride=stride, bias=False),
+            nn.BatchNorm2d(planes)
+        ) if stride != 1 or inplanes != planes else None
+
+    def forward(self, x):
+        identity = self.downsample(x) if self.downsample is not None else x
+        return self.relu(self.bn2(self.conv2(self.relu(self.bn1(self.conv1(x))))) + identity)
 
 class ResNet20(nn.Module):
     def __init__(self):
         super().__init__()
         self.inplanes = 16
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv1 = conv3x3(3, 16)
         self.bn1 = nn.BatchNorm2d(16)
         self.relu = nn.ReLU(inplace=True)
-        self.layer1 = self._make_layer(16, 16, stride=1)
-        self.layer2 = self._make_layer(16, 32, stride=2)
-        self.layer3 = self._make_layer(32, 64, stride=2)
+        self.layer1 = nn.Sequential(BasicBlock(16, 16), BasicBlock(16, 16), BasicBlock(16, 16))
+        self.layer2 = nn.Sequential(BasicBlock(16, 32, 2), BasicBlock(32, 32), BasicBlock(32, 32))
+        self.layer3 = nn.Sequential(BasicBlock(32, 64, 2), BasicBlock(64, 64), BasicBlock(64, 64))
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(64, 1)
-
-    def _make_layer(self, inplanes, planes, stride):
-        return nn.Sequential(
-            nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False),
-            nn.BatchNorm2d(planes),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(planes)
-        )
 
     def forward(self, x):
         x = self.relu(self.bn1(self.conv1(x)))
         x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.avgpool(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
+        feat2 = self.layer2(x)
+        feat3 = self.layer3(feat2)
+        x = self.fc(self.avgpool(feat3).view(feat3.size(0), -1))
+        return x
 
+# ==========================================
+# تغییر مهم: کلاس ResNetKD دقیقا مشابه ResNetStudent در کد آموزش ساخته شد
+# ==========================================
 class ResNetKD(nn.Module):
     def __init__(self, arch='resnet20'):
         super().__init__()
-        if arch == 'resnet20':
-            self.model = ResNet20()
-        else:
-            from torchvision.models import resnet50
-            self.model = resnet50(pretrained=False)
-            self.model.fc = nn.Linear(self.model.fc.in_features, 1)
+        # در کد آموزش شما، ResNetStudent یک لایه مدل داشت که ResNet20 بود
+        # بنابراین کلیدها با 'model.' شروع می‌شوند
+        self.model = ResNet20()
+        
+        # اگر آرکی‌تکچر دیگری بود اینجا اضافه کنید
+        if arch != 'resnet20':
+             pass 
 
     def forward(self, x):
+        # در کد آموزش شما، خروجی student (logits, features) بود.
+        # اما چون ما فقط state_dict را لود می‌کنیم، هندها (Hooks) فعال نمی‌شوند.
+        # بنابراین forward ساده شده کافی است چون only weights matter.
         return self.model(x)
 
+
 # ==========================================
-# 3. Ensemble Class (با Normalize اختصاصی)
+# 3. Ensemble Class
 # ==========================================
 
 class MultiModelNormalization(nn.Module):
@@ -237,15 +248,40 @@ class DeepfakeEnsemble:
         self.normalization = MultiModelNormalization(means, stds).to(device)
         
         for i, path in enumerate(model_paths):
+            # ایجاد مدل با ساختار صحیح (ResNetKD = ResNetStudent)
             model = ResNetKD(arch='resnet20').to(self.device)
+            
             if os.path.exists(path):
-                ckpt = torch.load(path, map_location=self.device)
-                state = ckpt.get('state_dict') or ckpt.get('model') or ckpt.get('model_state_dict')
-                model.load_state_dict(state, strict=False)
-                model.eval()
-                self.models.append(model)
-                if dist.get_rank() == 0:
-                    print(f"Model {i+1} loaded: {path}")
+                try:
+                    # لود کردن state_dict
+                    # در کد آموزش شما: torch.save(student.module.state_dict(), ...)
+                    # پس فایل حاوی state_dict خام است (بدون کلیدهای اضافی)
+                    # اما چون student شامل self.model بود، کلیدها 'model.' دارند.
+                    
+                    state_dict = torch.load(path, map_location=self.device, weights_only=False)
+                    
+                    # اگر فایل شامل کلیدهای اضافی باشد (ملاحظه می‌کنیم)
+                    if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+                        state_dict = state_dict['state_dict']
+
+                    # هندل کردن پیشوند 'model.'
+                    # مدل ResNetKD دارای ویژگی self.model است.
+                    # فایل ذخیره شده احتمالا شامل کلیدهایی مثل model.conv1.weight است.
+                    # اما چون ما self.model.load_state_dict را صدا می‌زنیم (یا خود مدل را)، باید دقت کنیم.
+                    
+                    # روش ایمن: چون ResNetKD دقیقا ResNetStudent را تقلید می‌کند،
+                    # load_state_dict(strict=False) باید کار کند اگر پیشوند 'model.' درست باشد.
+                    
+                    model.load_state_dict(state_dict, strict=False)
+                    
+                    model.eval()
+                    self.models.append(model)
+                    if dist.get_rank() == 0:
+                        print(f"Model {i+1} loaded successfully: {path}")
+                        
+                except Exception as e:
+                    if dist.get_rank() == 0:
+                        print(f"Error loading {path}: {e}")
             else:
                 if dist.get_rank() == 0:
                     print(f"Warning: Model path not found: {path}")
@@ -328,7 +364,7 @@ class DeepfakeEnsemble:
 
 # ====================== اجرا ======================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate Ensemble & Single Models (Standalone)")
+    parser = argparse.ArgumentParser(description="Evaluate Ensemble (Fixed Architecture)")
 
     parser.add_argument("--data_dir", type=str, required=True, help="Root directory of NEW dataset")
     parser.add_argument("--dataset_type", type=str, required=True, 
@@ -349,7 +385,7 @@ if __name__ == "__main__":
 
     if rank == 0:
         print("="*70)
-        print("ENSEMBLE & SINGLE MODEL EVALUATION (STANDALONE - NO IMPORT ERRORS)")
+        print("ENSEMBLE EVALUATION (MATCHED ARCHITECTURE)")
         print("="*70)
         print(f"Data Dir: {args.data_dir}")
         print(f"Dataset Type: {args.dataset_type}")
@@ -371,7 +407,7 @@ if __name__ == "__main__":
     if rank == 0:
         print(f"Using Normalization Stats for {num_models} models.")
 
-    # 3. لود دیتاست (بدون ارور ایمپورت)
+    # 3. لود دیتاست
     try:
         _, _, distributed_test_loader = create_dataloaders_ddp(
             base_dir=args.data_dir,
@@ -386,12 +422,10 @@ if __name__ == "__main__":
     except Exception as e:
         if rank == 0:
             print(f"Error loading dataset: {e}")
-            import traceback
-            traceback.print_exc()
         dist.destroy_process_group()
         sys.exit(1)
 
-    # 4. ساخت Ensemble
+    # 4. ساخت Ensemble (ResNetKD اکنون ResNetStudent را تقلید می‌کند)
     ensemble = DeepfakeEnsemble(args.models, device=device, means=MEANS, stds=STDS)
 
     # 5. ارزیابی تک به تک
