@@ -144,34 +144,51 @@ def at_loss(teacher_features, student_features):
     return loss
 
 class RKDLoss(nn.Module):
-    def __init__(self, dist_weight=1.0, angle_weight=2.0, eps=1e-8):
+    def __init__(self, dist_weight=1.0, angle_weight=2.0, eps=1e-7):
         super().__init__()
         self.dist_weight = dist_weight
         self.angle_weight = angle_weight
         self.eps = eps
 
     def forward(self, teacher_emb, student_emb):
+        # ساختار روابط برای معلم نیازی به گرادیان ندارد
         with torch.no_grad():
             t_dist = self.pairwise_distance(teacher_emb)
-            t_angle = self.pairwise_angle(teacher_emb)
+            t_angle = self.pairwise_triplet_angle(teacher_emb)
         
         s_dist = self.pairwise_distance(student_emb)
-        s_angle = self.pairwise_angle(student_emb)
+        s_angle = self.pairwise_triplet_angle(student_emb)
 
+        # محاسبه Huber Loss (Smooth L1) مطابق مقاله
         loss_dist = F.smooth_l1_loss(s_dist, t_dist, reduction='mean', beta=1.0)
         loss_angle = F.smooth_l1_loss(s_angle, t_angle, reduction='mean', beta=1.0)
 
         return self.dist_weight * loss_dist + self.angle_weight * loss_angle
 
     def pairwise_distance(self, x):
+        # محاسبه فاصله اقلیدسی بین تمام زوج‌ها
         dist = torch.cdist(x, x, p=2)
-        return dist / (dist.mean().detach() + self.eps)
+        # نرمال‌سازی فواصل بر اساس میانگین (فرمول اصلی مقاله برای یکسان‌سازی اسکیل‌ها)
+        mean_dist = dist.mean().detach()
+        return dist / (mean_dist + self.eps)
 
-    def pairwise_angle(self, x):
-        x_norm = F.normalize(x, p=2, dim=1)
-        cosine = torch.mm(x_norm, x_norm.t())
-        angle = torch.acos(torch.clamp(cosine, -1.0 + self.eps, 1.0 - self.eps))
-        return angle
+    def pairwise_triplet_angle(self, x):
+        # x: [B, D]
+        # محاسبه بردار تفاضل بین تمام نمونه‌ها: [B, B, D] -> diff[i, j] = x_i - x_j
+        diff = x.unsqueeze(1) - x.unsqueeze(0)
+        
+        # نرمالایز کردن بردارهای تفاضل
+        norm = torch.norm(diff, p=2, dim=2, keepdim=True)
+        normed_diff = diff / (norm + self.eps) # [B, B, D]
+
+        # انتقال به فرمت [J, I, D] برای محاسبه زاویه حول راس J
+        # می‌خواهیم ضرب داخلی بردارهای (x_i - x_j) و (x_k - x_j) را بگیریم
+        j_i_d = normed_diff.permute(1, 0, 2) # [B, B, D]
+        
+        # با استفاده از Batch Matrix Multiplication ماتریس ضرب داخلی سه‌تایی‌ها [B, B, B] به دست می‌آید
+        # نیازی به acos نیست؛ مستقیماً روی کسینوس‌ها لاس اعمال می‌شود که پایدارتر است.
+        cosine_triplets = torch.bmm(j_i_d, j_i_d.permute(0, 2, 1)) 
+        return cosine_triplets
 
 # ==========================================
 # 3. Models
@@ -250,17 +267,11 @@ class ResNet20(nn.Module):
 
     def forward(self, x):
         x = self.relu(self.bn1(self.conv1(x)))
-        
-        # اجرا برای فعال‌سازی هوک‌ها
-        x = self.layer1(x) 
+        x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
-        
-        # Pooling و Flatten
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
-        
-        # برگرداندن خروجی نهایی
         return self.fc(x)
 
 class ResNetStudent(nn.Module):
@@ -369,13 +380,12 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
                 elif kd_method == 'at':
                     loss = base_loss + at_loss(teacher_feats, student_feats)
                 elif kd_method == 'rkd':
-            
-                    gamma_rkd = 0.05  # مقدار شروع کوچک (مثلا 0.05 یا 0.1)
-                    
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
                     s_feat = student_feats[-1] if isinstance(student_feats, list) else student_feats
                     s_emb = student.module.model.avgpool(s_feat).flatten(1)
-                    loss = base_loss + gamma_rkd * rkd_criterion(t_emb, s_emb)
+                    
+                    # اعمال ضریب تاثیر beta برای جلوگیری از سرکوب شدن base_loss
+                    loss = alpha * base_loss + beta * rkd_criterion(t_emb, s_emb)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -385,15 +395,16 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
 
             running_loss += loss.item()
             
-            # --- محاسبه Train Accuracy (اصلاح شده) ---
             with torch.no_grad():
                 preds = (torch.sigmoid(student_logits) > 0.5).float()
                 running_corrects += (preds == labels).sum().item()
                 total_samples += labels.size(0)
 
             if local_rank == 0:
+                # اصلاح باگ نمایش لاس: تقسیم بر تعداد بچ‌های طی شده تا این لحظه
+                processed_batches = (total_samples / batch_size)
                 data_iter.set_postfix({
-                    'Loss': f'{running_loss/(len(data_iter)):.4f}',
+                    'Loss': f'{running_loss / processed_batches:.4f}',
                     'Acc': f'{(running_corrects/total_samples)*100:.2f}%',
                     'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
                 })
