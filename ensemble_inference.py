@@ -11,12 +11,28 @@ import numpy as np
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
 import argparse
 import warnings
+import sys
 
 # ---- Distributed Imports ----
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 
 warnings.filterwarnings("ignore")
+
+# ==========================================
+# 0. ایمپورت تنظیمات دیتاست (base_dataset.py)
+# ==========================================
+# توجه: برای اینکه این ایمپورت کار کند، فایل base_dataset.py باید در مسیر پروژه باشد.
+# ساختار پوشه معمولاً به این صورت است:
+# project_root/
+#   ├── dynamic_hesitant/
+#   │   └── datasets/
+#   │       └── base_dataset.py
+#   └── this_script.py
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dynamic_hesitant.datasets.base_dataset import create_dataloaders_ddp
+
 
 # ==========================================
 # 1. Models (ResNet20 & Wrapper)
@@ -59,51 +75,13 @@ class ResNetKD(nn.Module):
         if arch == 'resnet20':
             self.model = ResNet20()
         else:
+            # اگر مدل‌های شما ResNet50 هستند اینجا تغییر دهید
             from torchvision.models import resnet50
             self.model = resnet50(pretrained=False)
             self.model.fc = nn.Linear(self.model.fc.in_features, 1)
 
     def forward(self, x):
         return self.model(x)
-
-# ==========================================
-# 2. Dataset (Simple & Generic for New Data)
-# ==========================================
-
-class FaceDataset(Dataset):
-    def __init__(self, data_frame, root_dir, transform=None, img_column='images_id'):
-        self.data = data_frame
-        self.root_dir = root_dir
-        self.transform = transform
-        self.img_column = img_column
-        self.label_map = {1: 1, 0: 0, 'real': 1, 'fake': 0, 'Real': 1, 'Fake': 0}
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        # هندل کردن مسیر فایل
-        path_in_csv = self.data[self.img_column].iloc[idx]
-        
-        # اگر مسیر کامل نیست به root_dir اضافه کن
-        if not os.path.isabs(path_in_csv):
-            img_name = os.path.join(self.root_dir, path_in_csv)
-        else:
-            img_name = path_in_csv
-            
-        if not os.path.exists(img_name):
-            # اگر عکس پیدا نشد (برای جلوگیری از کرش)
-            image = Image.new('RGB', (256, 256))
-            label = 0
-            if dist.get_rank() == 0:
-                print(f"Warning: Image not found {img_name}, using dummy.")
-        else:
-            image = Image.open(img_name).convert('RGB')
-            label = self.label_map[str(self.data['label'].iloc[idx]).lower()]
-        
-        if self.transform:
-            image = self.transform(image)
-        return image, torch.tensor(label, dtype=torch.float)
 
 # ==========================================
 # 3. Ensemble Class (با Normalize اختصاصی)
@@ -129,7 +107,10 @@ class DeepfakeEnsemble:
         self.normalization = MultiModelNormalization(means, stds).to(device)
         
         for i, path in enumerate(model_paths):
+            # هندل کردن آرگومان arch اگر لازم باشد
+            # اینجا فرض می‌کنیم همه مدل‌ها ResNet20 هستند. اگر نیستند مسیر را چک کنید.
             model = ResNetKD(arch='resnet20').to(self.device)
+            
             if os.path.exists(path):
                 ckpt = torch.load(path, map_location=self.device)
                 state = ckpt.get('state_dict') or ckpt.get('model') or ckpt.get('model_state_dict')
@@ -243,11 +224,13 @@ class DeepfakeEnsemble:
 
 # ====================== اجرا ======================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate Ensemble & Single Models on NEW Dataset")
+    parser = argparse.ArgumentParser(description="Evaluate Ensemble & Single Models on NEW Dataset (using base_dataset.py)")
 
-    # تنظیمات دیتاست جدید
-    parser.add_argument("--test_csv", type=str, required=True, help="Path to NEW test CSV")
-    parser.add_argument("--root_dir", type=str, required=True, help="Root directory of NEW images")
+    # تنظیمات دیتاست جدید (تغییر یافته: حذف CSV و اضافه شدن data_dir و dataset_type)
+    parser.add_argument("--data_dir", type=str, required=True, help="Root directory of NEW dataset")
+    parser.add_argument("--dataset_type", type=str, required=True, 
+                        choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV'],
+                        help="Type of dataset structure (defined in base_dataset.py)")
     parser.add_argument("--batch_size", type=int, default=64)
     
     # مسیر مدل‌های آموزش داده شده
@@ -261,18 +244,18 @@ if __name__ == "__main__":
     torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
     world_size = dist.get_world_size()
+    rank = dist.get_rank()
 
-    if dist.get_rank() == 0:
+    if rank == 0:
         print("="*70)
-        print("ENSEMBLE & SINGLE MODEL EVALUATION (NEW DATASET)")
+        print("ENSEMBLE & SINGLE MODEL EVALUATION (USING BASE_DATASET)")
         print("="*70)
-        print(f"Test CSV: {args.test_csv}")
-        print(f"Root Dir: {args.root_dir}")
+        print(f"Data Dir: {args.data_dir}")
+        print(f"Dataset Type: {args.dataset_type}")
         print(f"Models: {len(args.models)}")
         print("="*70)
 
     # 2. آماده‌سازی Mean/Std (طبق استاندارد مدل‌های شما)
-    # اگر مدل‌های شما Mean/Std متفاوتی دارند، این لیست را تغییر دهید
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS  = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
@@ -284,41 +267,28 @@ if __name__ == "__main__":
         MEANS = DEFAULT_MEANS[:num_models]
         STDS = DEFAULT_STDS[:num_models]
 
-    if dist.get_rank() == 0:
+    if rank == 0:
         print(f"Using Normalization Stats for {num_models} models.")
 
-    # 3. لود دیتاست (بدون Normalize، تبدیل خام به Tensor)
-    transform_test = transforms.Compose([
-        transforms.Resize((256, 256)), 
-        transforms.ToTensor()
-        # Normalize حذف شد
-    ])
-    
-    test_data = pd.read_csv(args.test_csv)
-    
-    # تشخیص نام ستون عکس (اختیاری)
-    img_col = 'images_id'
-    if img_col not in test_data.columns:
-        if 'path' in test_data.columns: img_col = 'path'
-        elif 'filename' in test_data.columns: img_col = 'filename'
-        else: img_col = test_data.columns[0] # ستون اول
-
-    test_dataset = FaceDataset(test_data, args.root_dir, transform=transform_test, img_column=img_col)
-    
-    test_sampler = DistributedSampler(
-        test_dataset, 
-        num_replicas=world_size, 
-        rank=local_rank, 
-        shuffle=False 
-    )
-    
-    distributed_test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        sampler=test_sampler,
-        num_workers=4,
-        pin_memory=True
-    )
+    # 3. لود دیتاست با استفاده از base_dataset.py
+    # این تابع 3 خروجی دارد: train, val, test. ما فقط test را می‌خواهیم.
+    # نکته: create_dataloaders_ddp نیاز به rank و world_size دارد.
+    try:
+        _, _, distributed_test_loader = create_dataloaders_ddp(
+            base_dir=args.data_dir,
+            batch_size=args.batch_size,
+            rank=rank,
+            world_size=world_size,
+            num_workers=4,  # تنظیم کنید
+            dataset_type=args.dataset_type
+        )
+        if rank == 0:
+            print(f"Dataset loaded successfully. Test batches: {len(distributed_test_loader)}")
+    except Exception as e:
+        if rank == 0:
+            print(f"Error loading dataset via base_dataset.py: {e}")
+        dist.destroy_process_group()
+        sys.exit(1)
 
     # 4. ساخت Ensemble با Mean/Std ها
     ensemble = DeepfakeEnsemble(
@@ -332,7 +302,7 @@ if __name__ == "__main__":
     single_models_metrics = []
     dist.barrier()
 
-    if dist.get_rank() == 0:
+    if rank == 0:
         print("\n" + "="*30)
         print("Starting Single Model Evaluation")
         print("="*30)
@@ -348,7 +318,7 @@ if __name__ == "__main__":
             model_name=model_name
         )
         
-        if dist.get_rank() == 0:
+        if rank == 0:
             single_models_metrics.append({
                 'index': i,
                 'name': model_name,
@@ -356,7 +326,7 @@ if __name__ == "__main__":
             })
 
     # 6. نمایش بهترین مدل تکی
-    if dist.get_rank() == 0:
+    if rank == 0:
         if single_models_metrics:
             best_model_info = max(single_models_metrics, key=lambda x: x['metrics']['auc'])
             print("\n" + "="*30)
