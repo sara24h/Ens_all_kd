@@ -282,15 +282,27 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
+        # ================== بخش اصلاح شده ==================
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank, world_size, local_rank = int(os.environ["RANK"]), int(os.environ['WORLD_SIZE']), int(os.environ['LOCAL_RANK'])
-        dist.init_process_group(backend='gloo')
-        torch.cuda.set_device(local_rank)
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        
+        # 🟢 راه‌حل ارور gloo: استفاده از device_id به جای torch.cuda.set_device
+        dist.init_process_group(
+            backend="gloo",
+            init_method="env://",
+            world_size=world_size,
+            rank=rank,
+            device_id=local_rank  # این خط ارور را برطرف می‌کند
+        )
+        
         device = torch.device(f'cuda:{local_rank}')
     else:
         rank, world_size, local_rank, device = 0, 1, 0, torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     is_main = rank == 0
+    # ==================================================
     if len(args.model_names) != len(args.models):
         raise ValueError("Number of model_names must match model_paths")
 
