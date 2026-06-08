@@ -287,7 +287,7 @@ def final_evaluation_unified(model, base_dataset, test_indices, device, save_dir
         
         if is_ensemble:
             final_output, weights, _, stacked_logits = model(image, return_details=True)
-            prob = torch.sigmoid(stacked_logits).mean(dim=1).item()
+            prob = torch.sigmoid(stacked_logits.mean(dim=1)).item()
         else:
             output = model(image)
             if isinstance(output, (tuple, list)): output = output[0]
