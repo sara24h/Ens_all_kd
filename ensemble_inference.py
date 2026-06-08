@@ -176,8 +176,6 @@ class PaperKDEnsemble(nn.Module):
 
 # ================== UNIFIED FINAL EVALUATION ==================
 @torch.no_grad()
-# ================== UNIFIED FINAL EVALUATION ==================
-@torch.no_grad()
 def final_evaluation_unified(model, base_dataset, test_indices, device, save_dir, model_name, args, is_main, model_names=None, is_ensemble=True):
     if not is_main: return 0.0
 
@@ -231,7 +229,6 @@ def final_evaluation_unified(model, base_dataset, test_indices, device, save_dir
     rec = TP / (TP + FN) if (TP + FN) > 0 else 0
     spec = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    # فقط اگر انسمبل باشد، ماتریس درهم‌ریختگی کامل چاپ می‌شود
     if is_ensemble:
         print(f"\n{'='*70}")
         print(f"FINAL RESULTS - {model_name}")
@@ -254,6 +251,24 @@ def final_evaluation_unified(model, base_dataset, test_indices, device, save_dir
 
     return acc * 100
 
+# ================== MODEL LOADING ==================
+def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
+    models = []
+    if is_main: print(f"Loading {len(model_paths)} KD Student models (ResNet20)...")
+    for i, path in enumerate(model_paths):
+        if not os.path.exists(path): continue
+        try:
+            model = ResNetKD().to(device)
+            state_dict = torch.load(path, map_location='cpu', weights_only=False)
+            if isinstance(state_dict, dict) and 'state_dict' in state_dict: state_dict = state_dict['state_dict']
+            model.load_state_dict(state_dict, strict=True)
+            model.eval()
+            models.append(model)
+            if is_main: print(f" [{i+1}/{len(model_paths)}] Loaded: {os.path.basename(path)}")
+        except Exception as e:
+            if is_main: print(f" [ERROR] Failed {path}: {e}")
+    if len(models) == 0: raise ValueError("No models loaded!")
+    return models
 
 # ================== MAIN FUNCTION ==================
 def main():
@@ -294,7 +309,7 @@ def main():
         test_loader, base_dataset, test_indices = create_local_dataloaders(
             args.data_dir, args.batch_size, args.dataset_type, args.seed)
             
-        # آپدیت BatchNorm برای دیتاست جدید
+        # آپدیت BatchNorm برای دیتاست جدید (حل مشکل دقت 50٪)
         print("\n" + "="*70)
         print("Adapting BatchNorm layers for the new dataset...")
         print("="*70)
@@ -306,7 +321,7 @@ def main():
             model.eval()
         print("BatchNorm adaptation complete!\n")
 
-        # 1. ارزیابی تک‌تک مدل‌ها (فقط محاسبه و چاپ Accuracy)
+        # 1. ارزیابی تک‌تک مدل‌ها (فقط چاپ دقت درصدی)
         print("\n" + "="*70)
         print("INDIVIDUAL MODEL PERFORMANCE")
         print("="*70)
@@ -333,7 +348,7 @@ def main():
         print(f"\nBest Single Model: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
         print("="*70)
 
-        # 2. ارزیابی انسمبل نهایی (چاپ ماتریس درهم‌ریختگی و جزئیات)
+        # 2. ارزیابی انسمبل نهایی (با جزئیات کامل و ماتریس درهم‌ریختگی)
         print("\n" + "="*70)
         print("FINAL ENSEMBLE EVALUATION")
         print("="*70)
