@@ -16,7 +16,7 @@ import torch.distributed as dist
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 0. Dataset Utilities (Copied from your dataset_utils.py)
+# 0. Dataset Utilities
 # ==========================================
 class TransformSubset(Subset):
     def __init__(self, dataset, indices, transform):
@@ -30,7 +30,6 @@ class TransformSubset(Subset):
             img = Image.open(img_path).convert('RGB')
         else:
             img, label = self.dataset[original_idx]
-
         if self.transform:
             img = self.transform(img)
         return img, label
@@ -71,7 +70,6 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42):
             if all(os.path.exists(os.path.join(possible_sub_dir, f)) for f in folders):
                 dataset_dir = possible_sub_dir
             else:
-                # جستجوی زیرپوشه‌ها
                 for dirpath, dirnames, _ in os.walk(base_dir):
                     if all(f in dirnames for f in folders):
                         dataset_dir = dirpath
@@ -85,7 +83,7 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42):
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
         return test_loader, full_dataset, test_indices
     else:
-        raise ValueError(f"Dataset type {dataset_type} not supported in standalone script.")
+        raise ValueError(f"Dataset type {dataset_type} not supported.")
 
 # ==========================================
 # 1. Models (ResNet20 Structure)
@@ -178,26 +176,18 @@ class PaperKDEnsemble(nn.Module):
 
 # ================== UNIFIED FINAL EVALUATION ==================
 @torch.no_grad()
-def final_evaluation_and_report(ensemble, loader, base_dataset, test_indices, device, save_dir, args, is_main):
-    if not is_main: return 0.0, None, None
+def final_evaluation_unified(model, base_dataset, test_indices, device, save_dir, model_name, args, is_main, model_names=None, is_ensemble=True):
+    if not is_main: return 0.0
 
-    ensemble.eval()
+    model.eval()
     all_y_true, all_y_score, all_y_pred = [], [], []
-    lines = []
-
-    lines.append("="*100)
-    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
-    lines.append("="*100)
-    header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
-    lines.append(header)
-    lines.append("-"*100)
-
+    
     TP, TN, FP, FN = 0, 0, 0, 0
     correct_count, total_samples = 0, 0
 
-    print(f"\nRunning Final Evaluation on {len(test_indices)} samples...")
+    print(f"\nRunning Final Evaluation on {len(test_indices)} samples for [{model_name}]...")
     
-    for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
+    for i, global_idx in enumerate(tqdm(test_indices, desc=f"Eval {model_name}")):
         try:
             image, label = base_dataset[global_idx]
             path, _ = get_sample_info(base_dataset, global_idx)
@@ -207,14 +197,18 @@ def final_evaluation_and_report(ensemble, loader, base_dataset, test_indices, de
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
         
-        # 🟢 رفع باگ سینتکس: استفاده از _ به جای None
-        final_output, weights, _, stacked_logits = ensemble(image, return_details=True)
-        
-        probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
-        pred_int = int(probs > 0.5)
+        if is_ensemble:
+            final_output, weights, _, stacked_logits = model(image, return_details=True)
+            prob = torch.sigmoid(stacked_logits).mean(dim=1).item()
+        else:
+            output = model(image)
+            if isinstance(output, (tuple, list)): output = output[0]
+            prob = torch.sigmoid(output.squeeze()).item()
+            
+        pred_int = int(prob > 0.5)
         
         all_y_true.append(label_int)
-        all_y_score.append(probs)
+        all_y_score.append(prob)
         all_y_pred.append(pred_int)
         
         is_correct = (pred_int == label_int)
@@ -228,11 +222,6 @@ def final_evaluation_and_report(ensemble, loader, base_dataset, test_indices, de
             else: TN += 1
             
         total_samples += 1
-        
-        filename = os.path.basename(path)
-        if len(filename) > 55: filename = filename[:25] + "..." + filename[-27:]
-        line = f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
-        lines.append(line)
 
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
@@ -240,24 +229,28 @@ def final_evaluation_and_report(ensemble, loader, base_dataset, test_indices, de
     rec = TP / (TP + FN) if (TP + FN) > 0 else 0
     spec = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    print(f"\n{'='*70}\nFINAL RESULTS\n{'='*70}")
-    print(f"Precision: {prec:.4f}\nRecall: {rec:.4f}\nSpecificity: {spec:.4f}")
-    print(f"\nConfusion Matrix:\n                 Predicted Real  Predicted Fake")
+    print(f"\n{'='*70}")
+    print(f"FINAL RESULTS - {model_name}")
+    print(f"{'='*70}")
+    print(f"Precision: {prec:.4f} | Recall: {rec:.4f} | Specificity: {spec:.4f}")
+    print(f"Confusion Matrix:\n                 Predicted Real  Predicted Fake")
     print(f"    Actual Real      {TP:<15} {FN:<15}")
     print(f"    Actual Fake      {FP:<15} {TN:<15}")
-    print(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
+    print(f"Correct: {correct_count} ({acc*100:.2f}%) | Incorrect: {total - correct_count} ({(1-acc)*100:.2f}%)")
     print("="*70)
 
-    y_true_np, y_score_np, y_pred_np = np.array(all_y_true), np.array(all_y_score), np.array(all_y_pred)
-    roc_json_path = os.path.join(save_dir, "roc_data_test.json")
-    roc_data_json = {
-        "metadata": {"dataset": args.dataset_type, "num_samples": int(total_samples), "model": "paper_kd_ensemble"},
-        "y_true": y_true_np.tolist(), "y_score": y_score_np.tolist(), "y_pred": y_pred_np.tolist()
-    }
-    with open(roc_json_path, 'w', encoding='utf-8') as f: json.dump(roc_data_json, f, indent=2)
-    print(f"✅ Prediction log & ROC data saved to: {save_dir}")
+    # ذخیره داده‌های مک‌نمار و ROC فقط برای انسمبل نهایی
+    if is_ensemble:
+        y_true_np, y_score_np, y_pred_np = np.array(all_y_true), np.array(all_y_score), np.array(all_y_pred)
+        roc_json_path = os.path.join(save_dir, "roc_data_test.json")
+        roc_data_json = {
+            "metadata": {"dataset": args.dataset_type, "num_samples": int(total_samples), "model": "paper_kd_ensemble"},
+            "y_true": y_true_np.tolist(), "y_score": y_score_np.tolist(), "y_pred": y_pred_np.tolist()
+        }
+        with open(roc_json_path, 'w', encoding='utf-8') as f: json.dump(roc_data_json, f, indent=2)
+        print(f"✅ ROC data saved to: {roc_json_path}")
 
-    return acc * 100, y_true_np, y_score_np
+    return acc * 100
 
 # ================== MODEL LOADING ==================
 def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
@@ -285,6 +278,7 @@ def main():
     parser.add_argument('--dataset_type', type=str, required=True, choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV', 'real_fake_dataset', 'deepfake_lab'])
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--models', type=str, nargs='+', required=True)
+    parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output_kd')
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
@@ -298,6 +292,8 @@ def main():
         rank, world_size, local_rank, device = 0, 1, 0, torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     is_main = rank == 0
+    if len(args.model_names) != len(args.models):
+        raise ValueError("Number of model_names must match model_paths")
 
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
@@ -305,17 +301,64 @@ def main():
     STDS = STDS[:len(args.models)]
 
     base_models = load_kd_models(args.models, device, is_main)
-    ensemble = PaperKDEnsemble(base_models, MEANS, STDS).to(device)
+    MODEL_NAMES = args.model_names[:len(base_models)]
+    
+    normalizations = MultiModelNormalization(MEANS, STDS).to(device)
 
     if is_main:
         os.makedirs(args.save_dir, exist_ok=True)
         test_loader, base_dataset, test_indices = create_local_dataloaders(
             args.data_dir, args.batch_size, args.dataset_type, args.seed)
             
-        ensemble_test_acc, y_true, y_score = final_evaluation_and_report(
-            ensemble, test_loader, base_dataset, test_indices, device, args.save_dir, args, is_main
-        )
-        print(f"\nEnsemble Accuracy: {ensemble_test_acc:.2f}%")
+        # 1. ارزیابی تک‌تک مدل‌ها مشابه کد Fuzzy شما
+        print("\n" + "="*70)
+        print("INDIVIDUAL MODEL PERFORMANCE")
+        print("="*70)
+        
+        individual_accs = []
+        for i, model in enumerate(base_models):
+            # چون مدل‌های ResNet20 نیازی به نرمالایز داخل کلاس انسمبل ندارند، اینجا دستی اعمال می‌کنیم
+            class SingleModelWrapper(nn.Module):
+                def __init__(self, model, norm, idx):
+                    super().__init__()
+                    self.model = model
+                    self.norm = norm
+                    self.idx = idx
+                def forward(self, x):
+                    return self.model(self.norm(x, self.idx))
+                    
+            wrapped_model = SingleModelWrapper(model, normalizations, i).to(device)
+            acc = final_evaluation_unified(wrapped_model, base_dataset, test_indices, device, args.save_dir, f"Model {i+1} ({MODEL_NAMES[i]})", args, is_main, is_ensemble=False)
+            individual_accs.append(acc)
+
+        best_single = max(individual_accs)
+        best_idx = individual_accs.index(best_single)
+
+        # 2. ارزیابی انسمبل نهایی
+        print("\n" + "="*70)
+        print("FINAL ENSEMBLE EVALUATION")
+        print("="*70)
+        
+        ensemble = PaperKDEnsemble(base_models, MEANS, STDS).to(device)
+        ensemble_acc = final_evaluation_unified(ensemble, base_dataset, test_indices, device, args.save_dir, "Paper KD Ensemble", args, is_main, MODEL_NAMES, is_ensemble=True)
+
+        # 3. مقایسه نهایی (دقیقاً مشابه کد Fuzzy Hesitant)
+        print("\n" + "="*70)
+        print("FINAL COMPARISON")
+        print("="*70)
+        print(f"Best Single Model: {best_single:.2f}%")
+        print(f"Ensemble Accuracy: {ensemble_acc:.2f}%")
+        print(f"Improvement: {ensemble_acc - best_single:+.2f}%")
+        print("="*70)
+
+        final_results = {
+            'method': 'Paper_KD_Ensemble',
+            'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
+            'ensemble': {'test_accuracy': float(ensemble_acc)},
+            'improvement': float(ensemble_acc - best_single)
+        }
+        with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
+            json.dump(final_results, f, indent=4)
 
     if dist.is_initialized(): dist.destroy_process_group()
 
