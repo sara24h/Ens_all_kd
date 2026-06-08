@@ -1,21 +1,91 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
+from torchvision import datasets, transforms
 from tqdm import tqdm
 import numpy as np
 from typing import List, Tuple
 import warnings
 import argparse
 import json
+from sklearn.model_selection import train_test_split
+from PIL import Image
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 warnings.filterwarnings("ignore")
 
-# ---- Importing your custom utilities ----
-from dataset_utils import create_dataloaders, get_sample_info
+# ==========================================
+# 0. Dataset Utilities (Copied from your dataset_utils.py)
+# ==========================================
+class TransformSubset(Subset):
+    def __init__(self, dataset, indices, transform):
+        super().__init__(dataset, indices)
+        self.transform = transform
+
+    def __getitem__(self, idx):
+        original_idx = self.indices[idx]
+        if hasattr(self.dataset, 'samples'):
+            img_path, label = self.dataset.samples[original_idx]
+            img = Image.open(img_path).convert('RGB')
+        else:
+            img, label = self.dataset[original_idx]
+
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+def get_sample_info(dataset, index):
+    if hasattr(dataset, 'samples'):
+        return dataset.samples[index]
+    elif hasattr(dataset, 'dataset'):
+        return get_sample_info(dataset.dataset, index)
+    else:
+        raise AttributeError("Cannot find samples in dataset")
+
+def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    num_samples = len(dataset)
+    indices = list(range(num_samples))
+    labels = [dataset.samples[i][1] for i in indices]
+    train_val_indices, test_indices = train_test_split(indices, test_size=test_ratio, random_state=seed, stratify=labels)
+    val_size_adjusted = val_ratio / (train_ratio + val_ratio)
+    train_indices, val_indices = train_test_split(train_val_indices, test_size=val_size_adjusted, random_state=seed, stratify=[labels[i] for i in train_val_indices])
+    return train_indices, val_indices, test_indices
+
+def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42):
+    val_test_transform = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(256), transforms.ToTensor()])
+    
+    dataset_paths = {
+        'real_fake': ['training_fake', 'training_real'],
+        'hard_fake_real': ['fake', 'real'],
+        'deepflux': ['Fake', 'Real'],
+        'real_fake_dataset': ['face_fake', 'face_real'], 
+        'deepfake_lab': ['training_fake', 'training_real'], 
+    }
+
+    if dataset_type in dataset_paths:
+        folders = dataset_paths[dataset_type]
+        dataset_dir = base_dir
+        if not all(os.path.exists(os.path.join(dataset_dir, f)) for f in folders):
+            possible_sub_dir = os.path.join(base_dir, dataset_type)
+            if all(os.path.exists(os.path.join(possible_sub_dir, f)) for f in folders):
+                dataset_dir = possible_sub_dir
+            else:
+                # جستجوی زیرپوشه‌ها
+                for dirpath, dirnames, _ in os.walk(base_dir):
+                    if all(f in dirnames for f in folders):
+                        dataset_dir = dirpath
+                        break
+        
+        temp_transform = transforms.Compose([transforms.ToTensor()])
+        full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
+        train_indices, val_indices, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
+        
+        test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        return test_loader, full_dataset, test_indices
+    else:
+        raise ValueError(f"Dataset type {dataset_type} not supported in standalone script.")
 
 # ==========================================
 # 1. Models (ResNet20 Structure)
@@ -99,7 +169,6 @@ class PaperKDEnsemble(nn.Module):
                 if out.dim() == 1: out = out.unsqueeze(1)
             outputs[:, i] = out
         
-        # Soft Voting روی Logitها
         final_output = outputs.mean(dim=1)
         
         if return_details:
@@ -109,23 +178,10 @@ class PaperKDEnsemble(nn.Module):
 
 # ================== UNIFIED FINAL EVALUATION ==================
 @torch.no_grad()
-def final_evaluation_and_report(ensemble, loader, device, save_dir, model_name, args, is_main):
-    if not is_main or loader is None: return 0.0, None, None
+def final_evaluation_and_report(ensemble, loader, base_dataset, test_indices, device, save_dir, args, is_main):
+    if not is_main: return 0.0, None, None
 
     ensemble.eval()
-    
-    # استخراج دیتاست پایه و اندیس‌ها
-    base_dataset = loader.dataset
-    if hasattr(base_dataset, 'dataset'):
-        base_dataset = base_dataset.dataset
-        
-    if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'indices'):
-        test_indices = loader.sampler.indices
-    elif hasattr(loader.dataset, 'indices'):
-        test_indices = loader.dataset.indices
-    else:
-        test_indices = list(range(len(base_dataset)))
-
     all_y_true, all_y_score, all_y_pred = [], [], []
     lines = []
 
@@ -151,7 +207,9 @@ def final_evaluation_and_report(ensemble, loader, device, save_dir, model_name, 
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
         
+        # 🟢 رفع باگ سینتکس: استفاده از _ به جای None
         final_output, weights, _, stacked_logits = ensemble(image, return_details=True)
+        
         probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
         pred_int = int(probs > 0.5)
         
@@ -190,17 +248,6 @@ def final_evaluation_and_report(ensemble, loader, device, save_dir, model_name, 
     print(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
     print("="*70)
 
-    output_str = []
-    output_str.append("-" * 100)
-    output_str.append("SUMMARY STATISTICS:")
-    output_str.append(f"Accuracy: {acc*100:.2f}%")
-    output_str.append(f"Precision: {prec:.4f}\nRecall: {rec:.4f}\nSpecificity: {spec:.4f}")
-    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
-    output_str.extend(lines)
-
-    log_path = os.path.join(save_dir, 'prediction_log.txt')
-    with open(log_path, 'w') as f: f.write("\n".join(output_str))
-
     y_true_np, y_score_np, y_pred_np = np.array(all_y_true), np.array(all_y_score), np.array(all_y_pred)
     roc_json_path = os.path.join(save_dir, "roc_data_test.json")
     roc_data_json = {
@@ -217,9 +264,7 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
     models = []
     if is_main: print(f"Loading {len(model_paths)} KD Student models (ResNet20)...")
     for i, path in enumerate(model_paths):
-        if not os.path.exists(path):
-            if is_main: print(f" [WARNING] File not found: {path}")
-            continue
+        if not os.path.exists(path): continue
         try:
             model = ResNetKD().to(device)
             state_dict = torch.load(path, map_location='cpu', weights_only=False)
@@ -262,16 +307,13 @@ def main():
     base_models = load_kd_models(args.models, device, is_main)
     ensemble = PaperKDEnsemble(base_models, MEANS, STDS).to(device)
 
-    # برای ارزیابی نهایی با جزئیات، دیتالودر غیرتوزیع‌شده می‌سازیم (فقط روی رنک 0)
     if is_main:
         os.makedirs(args.save_dir, exist_ok=True)
-        _, _, test_loader_full = create_dataloaders(
-            args.data_dir, args.batch_size, num_workers=2,
-            dataset_type=args.dataset_type, is_distributed=False, 
-            seed=args.seed, is_main=True
-        )
+        test_loader, base_dataset, test_indices = create_local_dataloaders(
+            args.data_dir, args.batch_size, args.dataset_type, args.seed)
+            
         ensemble_test_acc, y_true, y_score = final_evaluation_and_report(
-            ensemble, test_loader_full, device, args.save_dir, "Paper KD Ensemble", args, is_main
+            ensemble, test_loader, base_dataset, test_indices, device, args.save_dir, args, is_main
         )
         print(f"\nEnsemble Accuracy: {ensemble_test_acc:.2f}%")
 
