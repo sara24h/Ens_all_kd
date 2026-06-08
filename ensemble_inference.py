@@ -300,22 +300,25 @@ class DeepfakeEnsemble:
         return ensemble_prob, ensemble_pred
 
     def _gather_and_compute_metrics(self, local_probs, local_labels, dataset_name="Model"):
-        gathered_probs = [None for _ in range(dist.get_world_size())]
-        gathered_labels = [None for _ in range(dist.get_world_size())]
-        dist.all_gather_object(gathered_probs, local_probs)
-        dist.all_gather_object(gathered_labels, local_labels)
-
         metrics = {}
+        # چون هیچ DistributedSampler برای تست تعریف نشده،
+        # تمام GPUها کل داده را دیده‌اند و local_probs در همه GPUها یکسان است.
+        # بنابراین فقط رنک ۰ متریک را محاسبه می‌کند و نیازی به gather نیست.
         if dist.get_rank() == 0:
-            final_probs = np.concatenate(gathered_probs)
-            final_labels = np.concatenate(gathered_labels)
+            final_probs = local_probs
+            final_labels = local_labels
             final_preds = (final_probs > 0.5).astype(float)
             
             acc = accuracy_score(final_labels, final_preds)
-            auc = roc_auc_score(final_labels, final_probs)
+            # محافظت در برابر دیتاست‌هایی که فقط یک کلاس دارند
+            try:
+                auc = roc_auc_score(final_labels, final_probs)
+            except ValueError:
+                auc = 0.0
+                
             prec = precision_score(final_labels, final_preds, zero_division=0)
-            rec = recall_score(final_labels, final_preds)
-            f1 = f1_score(final_labels, final_preds)
+            rec = recall_score(final_labels, final_preds, zero_division=0)
+            f1 = f1_score(final_labels, final_preds, zero_division=0)
             
             print(f"\n=== {dataset_name} Results ===")
             print(f"Accuracy  : {acc:.4f}")
@@ -324,6 +327,9 @@ class DeepfakeEnsemble:
             print(f"Recall    : {rec:.4f}")
             print(f"F1-Score  : {f1:.4f}")
             metrics = {'acc': acc, 'auc': auc, 'f1': f1, 'prec': prec, 'rec': rec}
+            
+        # بقیه GPUها منتظر رنک ۰ می‌مانند تا همگام‌سازی حفظ شود
+        dist.barrier()
         return metrics
 
     def evaluate_single_model(self, model, dataloader, model_index, model_name="Single Model"):
