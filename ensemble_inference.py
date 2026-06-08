@@ -269,7 +269,7 @@ def main():
 
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank, world_size, local_rank = int(os.environ["RANK"]), int(os.environ['WORLD_SIZE']), int(os.environ['LOCAL_RANK'])
-        dist.init_process_group(backend='nccl')
+        dist.init_process_group(backend='gloo')
         torch.cuda.set_device(local_rank)
         device = torch.device(f'cuda:{local_rank}')
     else:
