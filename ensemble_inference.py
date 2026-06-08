@@ -263,16 +263,8 @@ class DeepfakeEnsemble:
                     # اگر فایل شامل کلیدهای اضافی باشد (ملاحظه می‌کنیم)
                     if isinstance(state_dict, dict) and 'state_dict' in state_dict:
                         state_dict = state_dict['state_dict']
-
-                    # هندل کردن پیشوند 'model.'
-                    # مدل ResNetKD دارای ویژگی self.model است.
-                    # فایل ذخیره شده احتمالا شامل کلیدهایی مثل model.conv1.weight است.
-                    # اما چون ما self.model.load_state_dict را صدا می‌زنیم (یا خود مدل را)، باید دقت کنیم.
-                    
-                    # روش ایمن: چون ResNetKD دقیقا ResNetStudent را تقلید می‌کند،
-                    # load_state_dict(strict=False) باید کار کند اگر پیشوند 'model.' درست باشد.
-                    
-                    model.load_state_dict(state_dict, strict=False)
+                        
+                    model.load_state_dict(state_dict, strict=True)
                     
                     model.eval()
                     self.models.append(model)
