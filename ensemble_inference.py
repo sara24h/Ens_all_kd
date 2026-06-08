@@ -320,18 +320,6 @@ def main():
         os.makedirs(args.save_dir, exist_ok=True)
         test_loader, base_dataset, test_indices = create_local_dataloaders(
             args.data_dir, args.batch_size, args.dataset_type, args.seed)
-            
-        # آپدیت BatchNorm برای دیتاست جدید (حل مشکل دقت 50٪)
-        print("\n" + "="*70)
-        print("Adapting BatchNorm layers for the new dataset...")
-        print("="*70)
-        for i, model in enumerate(base_models):
-            model.train()
-            with torch.no_grad():
-                for images, _ in tqdm(test_loader, desc=f"Adapting {MODEL_NAMES[i]}"):
-                    _ = model(normalizations(images.to(device), i))
-            model.eval()
-        print("BatchNorm adaptation complete!\n")
 
         # 1. ارزیابی تک‌تک مدل‌ها (فقط چاپ دقت درصدی)
         print("\n" + "="*70)
