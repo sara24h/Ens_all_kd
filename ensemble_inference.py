@@ -151,7 +151,7 @@ def final_evaluation_and_report(ensemble, loader, device, save_dir, model_name, 
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
         
-        final_output, weights, None, stacked_logits = ensemble(image, return_details=True)
+        final_output, weights, _, stacked_logits = ensemble(image, return_details=True)
         probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
         pred_int = int(probs > 0.5)
         
