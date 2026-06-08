@@ -176,6 +176,8 @@ class PaperKDEnsemble(nn.Module):
 
 # ================== UNIFIED FINAL EVALUATION ==================
 @torch.no_grad()
+# ================== UNIFIED FINAL EVALUATION ==================
+@torch.no_grad()
 def final_evaluation_unified(model, base_dataset, test_indices, device, save_dir, model_name, args, is_main, model_names=None, is_ensemble=True):
     if not is_main: return 0.0
 
@@ -229,18 +231,18 @@ def final_evaluation_unified(model, base_dataset, test_indices, device, save_dir
     rec = TP / (TP + FN) if (TP + FN) > 0 else 0
     spec = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    print(f"\n{'='*70}")
-    print(f"FINAL RESULTS - {model_name}")
-    print(f"{'='*70}")
-    print(f"Precision: {prec:.4f} | Recall: {rec:.4f} | Specificity: {spec:.4f}")
-    print(f"Confusion Matrix:\n                 Predicted Real  Predicted Fake")
-    print(f"    Actual Real      {TP:<15} {FN:<15}")
-    print(f"    Actual Fake      {FP:<15} {TN:<15}")
-    print(f"Correct: {correct_count} ({acc*100:.2f}%) | Incorrect: {total - correct_count} ({(1-acc)*100:.2f}%)")
-    print("="*70)
-
-    # ذخیره داده‌های مک‌نمار و ROC فقط برای انسمبل نهایی
+    # فقط اگر انسمبل باشد، ماتریس درهم‌ریختگی کامل چاپ می‌شود
     if is_ensemble:
+        print(f"\n{'='*70}")
+        print(f"FINAL RESULTS - {model_name}")
+        print(f"{'='*70}")
+        print(f"Precision: {prec:.4f} | Recall: {rec:.4f} | Specificity: {spec:.4f}")
+        print(f"Confusion Matrix:\n                 Predicted Real  Predicted Fake")
+        print(f"    Actual Real      {TP:<15} {FN:<15}")
+        print(f"    Actual Fake      {FP:<15} {TN:<15}")
+        print(f"Correct: {correct_count} ({acc*100:.2f}%) | Incorrect: {total - correct_count} ({(1-acc)*100:.2f}%)")
+        print("="*70)
+
         y_true_np, y_score_np, y_pred_np = np.array(all_y_true), np.array(all_y_score), np.array(all_y_pred)
         roc_json_path = os.path.join(save_dir, "roc_data_test.json")
         roc_data_json = {
@@ -252,24 +254,6 @@ def final_evaluation_unified(model, base_dataset, test_indices, device, save_dir
 
     return acc * 100
 
-# ================== MODEL LOADING ==================
-def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
-    models = []
-    if is_main: print(f"Loading {len(model_paths)} KD Student models (ResNet20)...")
-    for i, path in enumerate(model_paths):
-        if not os.path.exists(path): continue
-        try:
-            model = ResNetKD().to(device)
-            state_dict = torch.load(path, map_location='cpu', weights_only=False)
-            if isinstance(state_dict, dict) and 'state_dict' in state_dict: state_dict = state_dict['state_dict']
-            model.load_state_dict(state_dict, strict=True)
-            model.eval()
-            models.append(model)
-            if is_main: print(f" [{i+1}/{len(model_paths)}] Loaded: {os.path.basename(path)}")
-        except Exception as e:
-            if is_main: print(f" [ERROR] Failed {path}: {e}")
-    if len(models) == 0: raise ValueError("No models loaded!")
-    return models
 
 # ================== MAIN FUNCTION ==================
 def main():
@@ -310,31 +294,46 @@ def main():
         test_loader, base_dataset, test_indices = create_local_dataloaders(
             args.data_dir, args.batch_size, args.dataset_type, args.seed)
             
-        # 1. ارزیابی تک‌تک مدل‌ها مشابه کد Fuzzy شما
+        # آپدیت BatchNorm برای دیتاست جدید
+        print("\n" + "="*70)
+        print("Adapting BatchNorm layers for the new dataset...")
+        print("="*70)
+        for i, model in enumerate(base_models):
+            model.train()
+            with torch.no_grad():
+                for images, _ in tqdm(test_loader, desc=f"Adapting {MODEL_NAMES[i]}"):
+                    _ = model(normalizations(images.to(device), i))
+            model.eval()
+        print("BatchNorm adaptation complete!\n")
+
+        # 1. ارزیابی تک‌تک مدل‌ها (فقط محاسبه و چاپ Accuracy)
         print("\n" + "="*70)
         print("INDIVIDUAL MODEL PERFORMANCE")
         print("="*70)
         
         individual_accs = []
         for i, model in enumerate(base_models):
-            # چون مدل‌های ResNet20 نیازی به نرمالایز داخل کلاس انسمبل ندارند، اینجا دستی اعمال می‌کنیم
-            class SingleModelWrapper(nn.Module):
-                def __init__(self, model, norm, idx):
-                    super().__init__()
-                    self.model = model
-                    self.norm = norm
-                    self.idx = idx
-                def forward(self, x):
-                    return self.model(self.norm(x, self.idx))
-                    
-            wrapped_model = SingleModelWrapper(model, normalizations, i).to(device)
-            acc = final_evaluation_unified(wrapped_model, base_dataset, test_indices, device, args.save_dir, f"Model {i+1} ({MODEL_NAMES[i]})", args, is_main, is_ensemble=False)
+            correct = 0
+            total = 0
+            model.eval()
+            with torch.no_grad():
+                for images, labels in test_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    out = model(normalizations(images, i))
+                    if isinstance(out, (tuple, list)): out = out[0]
+                    pred = (torch.sigmoid(out.squeeze()) > 0.5).long()
+                    correct += pred.eq(labels.long()).sum().item()
+                    total += labels.size(0)
+            acc = 100. * correct / total
             individual_accs.append(acc)
+            print(f" Model {i+1} ({MODEL_NAMES[i]}): {acc:.2f}%")
 
         best_single = max(individual_accs)
         best_idx = individual_accs.index(best_single)
+        print(f"\nBest Single Model: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+        print("="*70)
 
-        # 2. ارزیابی انسمبل نهایی
+        # 2. ارزیابی انسمبل نهایی (چاپ ماتریس درهم‌ریختگی و جزئیات)
         print("\n" + "="*70)
         print("FINAL ENSEMBLE EVALUATION")
         print("="*70)
@@ -342,7 +341,7 @@ def main():
         ensemble = PaperKDEnsemble(base_models, MEANS, STDS).to(device)
         ensemble_acc = final_evaluation_unified(ensemble, base_dataset, test_indices, device, args.save_dir, "Paper KD Ensemble", args, is_main, MODEL_NAMES, is_ensemble=True)
 
-        # 3. مقایسه نهایی (دقیقاً مشابه کد Fuzzy Hesitant)
+        # 3. مقایسه نهایی
         print("\n" + "="*70)
         print("FINAL COMPARISON")
         print("="*70)
