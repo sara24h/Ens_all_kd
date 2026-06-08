@@ -51,9 +51,18 @@ def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15,
     train_indices, val_indices = train_test_split(train_val_indices, test_size=val_size_adjusted, random_state=seed, stratify=[labels[i] for i in train_val_indices])
     return train_indices, val_indices, test_indices
 
-def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42):
+def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_distributed=False):
     val_test_transform = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(256), transforms.ToTensor()])
+    train_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.RandomCrop(256),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(0.2, 0.2),
+        transforms.ToTensor(),
+    ])
     
+    # تعریف مسیر پوشه‌ها برای دیتاست‌های ImageFolder
     dataset_paths = {
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
@@ -62,7 +71,85 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42):
         'deepfake_lab': ['training_fake', 'training_real'], 
     }
 
-    if dataset_type in dataset_paths:
+    print(f"\n[Dataset Loading] Processing: {dataset_type}")
+
+    # 1. دیتاست Wild
+    if dataset_type == 'wild':
+        splits = ['train', 'valid', 'test']
+        datasets_dict = {}
+        for split in splits:
+            path = os.path.join(base_dir, split)
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Folder not found: {path}")
+            transform = train_transform if split == 'train' else val_test_transform
+            datasets_dict[split] = datasets.ImageFolder(path, transform=transform)
+        
+        test_dataset = datasets_dict['test']
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        return test_loader, test_dataset, list(range(len(test_dataset)))
+
+    # 2. دیتاست UADFV
+    elif dataset_type == 'uadfV':
+        # استفاده از کلاس دیتاست اختصاصی شما
+        class UADFVDataset(Dataset):
+            def __init__(self, root_dir, transform=None):
+                self.root_dir = root_dir
+                self.transform = transform
+                self.samples = []
+                self.class_to_idx = {'fake': 0, 'real': 1}
+                for class_name in ['fake', 'real']:
+                    frames_dir = os.path.join(self.root_dir, class_name, 'frames')
+                    if os.path.exists(frames_dir):
+                        for subdir in os.listdir(frames_dir):
+                            subdir_path = os.path.join(frames_dir, subdir)
+                            if os.path.isdir(subdir_path):
+                                for img_file in os.listdir(subdir_path):
+                                    if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                        self.samples.append((os.path.join(subdir_path, img_file), self.class_to_idx[class_name]))
+            def __len__(self): return len(self.samples)
+            def __getitem__(self, idx):
+                img_path, label = self.samples[idx]
+                img = Image.open(img_path).convert('RGB')
+                if self.transform: img = self.transform(img)
+                return img, label
+
+        full_dataset = UADFVDataset(base_dir, transform=val_test_transform)
+        _, _, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
+        test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        return test_loader, full_dataset, test_indices
+
+    # 3. دیتاست‌های Custom GenAI
+    elif dataset_type in ['custom_genai', 'custom_genai_v2']:
+        # استفاده از کلاس NewGenAIDataset شما
+        class NewGenAIDataset(Dataset):
+            def __init__(self, root_dir, transform=None):
+                self.root_dir = root_dir
+                self.transform = transform
+                self.samples = []
+                self.label_map = {'fake': 0, 'real': 1}
+                for dirpath, dirnames, filenames in os.walk(self.root_dir):
+                    current_folder_name = os.path.basename(dirpath)
+                    if current_folder_name in ['real', 'fake']:
+                        label = self.label_map[current_folder_name]
+                        valid_files = [f for f in filenames if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                        for img_file in valid_files:
+                            self.samples.append((os.path.join(dirpath, img_file), label))
+            def __len__(self): return len(self.samples)
+            def __getitem__(self, idx):
+                img_path, label = self.samples[idx]
+                img = Image.open(img_path).convert('RGB')
+                if self.transform: img = self.transform(img)
+                return img, label
+
+        full_dataset = NewGenAIDataset(base_dir, transform=val_test_transform)
+        _, _, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
+        test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        return test_loader, full_dataset, test_indices
+
+    # 4. دیتاست‌های استاندارد ImageFolder (real_fake, hard_fake_real, etc.)
+    elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
         dataset_dir = base_dir
         if not all(os.path.exists(os.path.join(dataset_dir, f)) for f in folders):
@@ -82,6 +169,7 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42):
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
         return test_loader, full_dataset, test_indices
+    
     else:
         raise ValueError(f"Dataset type {dataset_type} not supported.")
 
