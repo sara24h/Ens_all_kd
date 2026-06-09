@@ -382,15 +382,14 @@ def train_student(local_rank, teacher_path, dataset_mode, kd_method='logits',
 
                 if kd_method == 'logits':
                     loss = alpha * base_loss + beta * logits_loss(teacher_logits, student_logits)
-                elif kd_method == 'at':
+                elif kd_method == 'at':                        # ✅ elif اضافه شد
                     loss = base_loss + at_loss(teacher_feats, student_feats)
-                elif kd_method == 'rkd':
+                elif kd_method == 'rkd':                       # ✅ elif اضافه شد
                     t_emb = teacher.model.avgpool(teacher_feats[-1]).flatten(1)
-                    s_feat = student_feats[-1] if isinstance(student_feats, list) else student_feats
+                    s_feat = student_feats[-1]
                     s_emb = student.module.model.avgpool(s_feat).flatten(1)
-                    
-                    # اعمال ضریب تاثیر beta برای جلوگیری از سرکوب شدن base_loss
-                    loss = alpha * base_loss + beta * rkd_criterion(t_emb, s_emb)
+                    loss = base_loss + rkd_criterion(t_emb, s_emb)
+
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
