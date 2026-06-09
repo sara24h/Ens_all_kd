@@ -255,7 +255,9 @@ class PaperKDEnsemble(nn.Module):
                 if out.dim() == 1: out = out.unsqueeze(1)
             outputs[:, i] = out
         
-        final_output = outputs.mean(dim=1)
+
+        probs = torch.sigmoid(outputs)   # ابتدا probability
+        final_output = probs.mean(dim=1) # سپس میانگین — soft voting واقعی
         
         if return_details:
             weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
@@ -263,8 +265,9 @@ class PaperKDEnsemble(nn.Module):
         return final_output, None
 
 # ================== UNIFIED FINAL EVALUATION ==================
+# ================== UNIFIED FINAL EVALUATION (BATCH-BASED) ==================
 @torch.no_grad()
-def final_evaluation_unified(model, base_dataset, test_indices, device, save_dir, model_name, args, is_main, model_names=None, is_ensemble=True):
+def final_evaluation_unified(model, test_loader, device, save_dir, model_name, args, is_main, is_ensemble=True):
     if not is_main: return 0.0
 
     model.eval()
@@ -273,44 +276,41 @@ def final_evaluation_unified(model, base_dataset, test_indices, device, save_dir
     TP, TN, FP, FN = 0, 0, 0, 0
     correct_count, total_samples = 0, 0
 
-    print(f"\nRunning Final Evaluation on {len(test_indices)} samples for [{model_name}]...")
+    print(f"\nRunning Fast Batch Evaluation on {len(test_loader.dataset)} samples for [{model_name}]...")
     
-    for i, global_idx in enumerate(tqdm(test_indices, desc=f"Eval {model_name}")):
-        try:
-            image, label = base_dataset[global_idx]
-            path, _ = get_sample_info(base_dataset, global_idx)
-        except Exception as e:
-            continue
-
-        image = image.unsqueeze(0).to(device)
-        label_int = int(label)
+    for images, labels in tqdm(test_loader, desc=f"Eval {model_name}"):
+        images = images.to(device)
+        labels_int = labels.long().tolist()  # تبدیل برچسب‌های این بچ به لیست پایتونی
         
         if is_ensemble:
-            final_output, weights, _, stacked_logits = model(image, return_details=True)
-            prob = torch.sigmoid(stacked_logits).mean(dim=1).item()
-            
+            # خروجی انسمبل شما (final_output) خودش میانگین احتمالات پس از سیگموئید است
+            # نیازی به بازپخش سیگموئید روی stacked_logits نیست
+            final_output, _ = model(images)
+            probs = final_output.squeeze(1).cpu().tolist()
         else:
-            output = model(image)
+            output = model(images)
             if isinstance(output, (tuple, list)): output = output[0]
-            prob = torch.sigmoid(output.squeeze()).item()
+            probs = torch.sigmoid(output.squeeze(1)).cpu().tolist()
             
-        pred_int = int(prob > 0.5)
-        
-        all_y_true.append(label_int)
-        all_y_score.append(prob)
-        all_y_pred.append(pred_int)
-        
-        is_correct = (pred_int == label_int)
-        if is_correct: correct_count += 1
-        
-        if label_int == 1:
-            if pred_int == 1: TP += 1
-            else: FN += 1
-        else:
-            if pred_int == 1: FP += 1
-            else: TN += 1
+        # پردازش نتایج بچ جاری
+        for prob, label_int in zip(probs, labels_int):
+            pred_int = int(prob > 0.5)
             
-        total_samples += 1
+            all_y_true.append(label_int)
+            all_y_score.append(prob)
+            all_y_pred.append(pred_int)
+            
+            if pred_int == label_int: 
+                correct_count += 1
+            
+            if label_int == 1:
+                if pred_int == 1: TP += 1
+                else: FN += 1
+            else:
+                if pred_int == 1: FP += 1
+                else: TN += 1
+                
+            total_samples += 1
 
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
@@ -329,13 +329,13 @@ def final_evaluation_unified(model, base_dataset, test_indices, device, save_dir
         print(f"Correct: {correct_count} ({acc*100:.2f}%) | Incorrect: {total - correct_count} ({(1-acc)*100:.2f}%)")
         print("="*70)
 
-        y_true_np, y_score_np, y_pred_np = np.array(all_y_true), np.array(all_y_score), np.array(all_y_pred)
         roc_json_path = os.path.join(save_dir, "roc_data_test.json")
         roc_data_json = {
             "metadata": {"dataset": args.dataset_type, "num_samples": int(total_samples), "model": "paper_kd_ensemble"},
-            "y_true": y_true_np.tolist(), "y_score": y_score_np.tolist(), "y_pred": y_pred_np.tolist()
+            "y_true": all_y_true, "y_score": all_y_score, "y_pred": all_y_pred
         }
-        with open(roc_json_path, 'w', encoding='utf-8') as f: json.dump(roc_data_json, f, indent=2)
+        with open(roc_json_path, 'w', encoding='utf-8') as f: 
+            json.dump(roc_data_json, f, indent=2)
         print(f"✅ ROC data saved to: {roc_json_path}")
 
     return acc * 100
@@ -437,13 +437,24 @@ def main():
         print(f"\nBest Single Model: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
         print("="*70)
 
-        # 2. ارزیابی انسمبل نهایی (با جزئیات کامل و ماتریس درهم‌ریختگی)
+        
         print("\n" + "="*70)
         print("FINAL ENSEMBLE EVALUATION")
         print("="*70)
         
         ensemble = PaperKDEnsemble(base_models, MEANS, STDS).to(device)
-        ensemble_acc = final_evaluation_unified(ensemble, base_dataset, test_indices, device, args.save_dir, "Paper KD Ensemble", args, is_main, MODEL_NAMES, is_ensemble=True)
+        
+        # تغییر کلیدی: پاس دادن test_loader به جای base_dataset و حذف آرگومان test_indices
+        ensemble_acc = final_evaluation_unified(
+            ensemble, 
+            test_loader, 
+            device, 
+            args.save_dir, 
+            "Paper KD Ensemble", 
+            args, 
+            is_main, 
+            is_ensemble=True
+        )
 
         # 3. مقایسه نهایی
         print("\n" + "="*70)
