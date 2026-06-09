@@ -291,6 +291,7 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     return acc * 100
 
 # ================== MODEL LOADING (اصلاح شدیه - رفع مشکل کلیدها) ==================
+# ================== MODEL LOADING (اصلاح نهایی) ==================
 def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     models = []
     if is_main: print(f"Loading {len(model_paths)} KD Student models (ResNet18)...")
@@ -300,30 +301,20 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
             model = ResNetKD().to(device)
             state_dict = torch.load(path, map_location='cpu', weights_only=False)
             
-            # اگر فایل دارای کلید state_dict باشد
+            # اگر فایل داخل یک کلید state_dict ذخیره شده بود
             if isinstance(state_dict, dict) and 'state_dict' in state_dict: 
                 state_dict = state_dict['state_dict']
             
-            # 🚀 رفع مشکل پیشوند model. 🚀
-            new_state_dict = {}
-            has_prefix = any(k.startswith('model.') for k in state_dict.keys())
-            if has_prefix:
-                if is_main: print(f"    > Detected 'model.' prefix in keys. Removing prefix...")
-                for k, v in state_dict.items():
-                    if k.startswith('model.'):
-                        new_state_dict[k[6:]] = v  # حذف 6 کاراکتر model.
-                    else:
-                        new_state_dict[k] = v
-                state_dict = new_state_dict
-
-            # لود کردن وزن‌ها
-            model.load_state_dict(state_dict, strict=True)
+            # 🚀 راه‌حل قطعی: لود کردن مستقیم وزن‌ها روی self.model 🚀
+            # چون فایل‌های pth کلیدهایی مثل conv1.weight دارند، 
+            # و در کلاس ResNetKD مدل داخل self.model است، مستقیما به آن مپ می‌کنیم.
+            model.model.load_state_dict(state_dict, strict=True)
+            
             model.eval()
             models.append(model)
             if is_main: print(f" [✅ {i+1}/{len(model_paths)}] Loaded: {os.path.basename(path)}")
             
         except Exception as e:
-            # چاپ خطای واقعی برای دیباگ
             if is_main: print(f" [❌ ERROR] Failed {path}: {e}")
             
     if len(models) == 0: raise ValueError("No models loaded!")
