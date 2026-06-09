@@ -133,13 +133,18 @@ def logits_loss(teacher_logits, student_logits):
 def at_loss(teacher_features, student_features):
     loss = 0.0
     for t_feat, s_feat in zip(teacher_features, student_features):
-        t_att = t_feat.pow(2).sum(1).view(t_feat.size(0), -1)
-        s_att = s_feat.pow(2).sum(1).view(s_feat.size(0), -1)
-        target_size = t_att.shape[1]
-        if s_att.shape[1] != target_size:
-            s_att = F.adaptive_avg_pool1d(s_att.unsqueeze(1), target_size).squeeze(1)
-        t_att = F.normalize(t_att, p=2, dim=1)
-        s_att = F.normalize(s_att, p=2, dim=1)
+        # ۱. محاسبه نقشه اتنشن به صورت 2D: [B, 1, H, W]
+        t_att = t_feat.pow(2).sum(1, keepdim=True)
+        s_att = s_feat.pow(2).sum(1, keepdim=True)
+        
+        # ۲. تغییر سایز دو بعدی با در نظر گرفتن ساختار تصویر
+        if s_att.shape[2:] != t_att.shape[2:]:
+            s_att = F.interpolate(s_att, size=t_att.shape[2:], mode='bilinear', align_corners=False)
+            
+        # ۳. فلت کردن و اعمال نرمال‌سازی L2 دایمنشن ۱
+        t_att = F.normalize(t_att.flatten(1), p=2, dim=1)
+        s_att = F.normalize(s_att.flatten(1), p=2, dim=1)
+        
         loss += (s_att - t_att).pow(2).sum(1).mean()
     return loss
 
