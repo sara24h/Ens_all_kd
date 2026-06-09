@@ -291,7 +291,7 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     return acc * 100
 
 # ================== MODEL LOADING (اصلاح شدیه - رفع مشکل کلیدها) ==================
-# ================== MODEL LOADING (اصلاح نهایی) ==================
+# ================== MODEL LOADING (رفع قطعی مشکل کلیدها) ==================
 def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     models = []
     if is_main: print(f"Loading {len(model_paths)} KD Student models (ResNet18)...")
@@ -305,10 +305,17 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
             if isinstance(state_dict, dict) and 'state_dict' in state_dict: 
                 state_dict = state_dict['state_dict']
             
-            # 🚀 راه‌حل قطعی: لود کردن مستقیم وزن‌ها روی self.model 🚀
-            # چون فایل‌های pth کلیدهایی مثل conv1.weight دارند، 
-            # و در کلاس ResNetKD مدل داخل self.model است، مستقیما به آن مپ می‌کنیم.
-            model.model.load_state_dict(state_dict, strict=True)
+            # 🚀 حذف پیشوند 'model.' از کلیدها 🚀
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                # اگر کلید با model. شروع شد، آن را حذف کن، در غیر این صورت کلید دست نخورده باقی بماند
+                if k.startswith('model.'):
+                    new_state_dict[k[6:]] = v
+                else:
+                    new_state_dict[k] = v
+            
+            # حالا وزن‌ها بدون مشکل روی self.model لود می‌شوند
+            model.model.load_state_dict(new_state_dict, strict=True)
             
             model.eval()
             models.append(model)
