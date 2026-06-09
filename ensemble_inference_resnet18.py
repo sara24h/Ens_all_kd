@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
-from torchvision.models import resnet18   # ✅ اضافه شد
+from torchvision.models import resnet18
 from tqdm import tqdm
 import numpy as np
 from typing import List, Tuple
@@ -17,7 +17,7 @@ import torch.distributed as dist
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 0. Dataset Utilities (بدون تغییر)
+# 0. Dataset Utilities (بدون تغییر - دقیقا همانی که خودتون داشتید)
 # ==========================================
 class TransformSubset(Subset):
     def __init__(self, dataset, indices, transform):
@@ -167,15 +167,14 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_dis
     else:
         raise ValueError(f"Dataset type {dataset_type} not supported.")
 
+
 # ==========================================
-# 1. Models (ResNet18 - جایگزین ResNet20)
+# 1. Models (اصلاح شده)
 # ==========================================
 class ResNetKD(nn.Module):
     def __init__(self):
         super().__init__()
-        # ✅ استفاده از ResNet18 استاندارد
         self.model = resnet18(weights=None)
-        # تغییر لایه نهایی برای خروجی باینری
         self.model.fc = nn.Linear(self.model.fc.in_features, 1)
 
     def forward(self, x):
@@ -219,7 +218,7 @@ class PaperKDEnsemble(nn.Module):
             return final_output, weights, None, outputs
         return final_output, None
 
-# ================== UNIFIED FINAL EVALUATION ==================
+# ================== UNIFIED FINAL EVALUATION (بدون تغییر) ==================
 @torch.no_grad()
 def final_evaluation_unified(model, test_loader, device, save_dir, model_name, args, is_main, is_ensemble=True):
     if not is_main: return 0.0
@@ -291,27 +290,46 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
 
     return acc * 100
 
-# ================== MODEL LOADING ==================
+# ================== MODEL LOADING (اصلاح شدیه - رفع مشکل کلیدها) ==================
 def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     models = []
     if is_main: print(f"Loading {len(model_paths)} KD Student models (ResNet18)...")
     for i, path in enumerate(model_paths):
         if not os.path.exists(path): continue
         try:
-            model = ResNetKD().to(device)                    # ✅ حالا ResNet18 است
+            model = ResNetKD().to(device)
             state_dict = torch.load(path, map_location='cpu', weights_only=False)
+            
+            # اگر فایل دارای کلید state_dict باشد
             if isinstance(state_dict, dict) and 'state_dict' in state_dict: 
                 state_dict = state_dict['state_dict']
+            
+            # 🚀 رفع مشکل پیشوند model. 🚀
+            new_state_dict = {}
+            has_prefix = any(k.startswith('model.') for k in state_dict.keys())
+            if has_prefix:
+                if is_main: print(f"    > Detected 'model.' prefix in keys. Removing prefix...")
+                for k, v in state_dict.items():
+                    if k.startswith('model.'):
+                        new_state_dict[k[6:]] = v  # حذف 6 کاراکتر model.
+                    else:
+                        new_state_dict[k] = v
+                state_dict = new_state_dict
+
+            # لود کردن وزن‌ها
             model.load_state_dict(state_dict, strict=True)
             model.eval()
             models.append(model)
-            if is_main: print(f" [{i+1}/{len(model_paths)}] Loaded: {os.path.basename(path)}")
+            if is_main: print(f" [✅ {i+1}/{len(model_paths)}] Loaded: {os.path.basename(path)}")
+            
         except Exception as e:
-            if is_main: print(f" [ERROR] Failed {path}: {e}")
+            # چاپ خطای واقعی برای دیباگ
+            if is_main: print(f" [❌ ERROR] Failed {path}: {e}")
+            
     if len(models) == 0: raise ValueError("No models loaded!")
     return models
 
-# ================== MAIN FUNCTION ==================
+# ================== MAIN FUNCTION (اصلاح شده برای اجرای تک‌کارت گرافیک) ==================
 def main():
     parser = argparse.ArgumentParser(description="Paper KD Ensemble")
     parser.add_argument('--batch_size', type=int, default=32)
@@ -324,16 +342,16 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ['LOCAL_RANK'])
-        dist.init_process_group(backend="gloo", init_method="env://", world_size=world_size, rank=rank)
-        device = torch.device(f'cuda:{local_rank}')
+    # 🚀 تنظیم خودکار کارت گرافیک بدون نیاز به torchrun 🚀
+    if torch.cuda.is_available():
+        device = torch.device('cuda:0')
+        is_main = True
+        rank, world_size, local_rank = 0, 1, 0
+        # نیازی به مقداردهی محیطی distributed نیست
     else:
-        rank, world_size, local_rank, device = 0, 1, 0, torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    is_main = rank == 0
+        device = torch.device('cpu')
+        is_main = True
+        rank, world_size, local_rank = 0, 1, 0
 
     if len(args.model_names) != len(args.models):
         raise ValueError("Number of model_names must match model_paths")
@@ -406,8 +424,6 @@ def main():
         }
         with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
             json.dump(final_results, f, indent=4)
-
-    if dist.is_initialized(): dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
