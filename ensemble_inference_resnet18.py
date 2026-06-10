@@ -13,6 +13,7 @@ import json
 from sklearn.model_selection import train_test_split
 from PIL import Image
 import torch.distributed as dist
+from sklearn.metrics import roc_auc_score
 
 warnings.filterwarnings("ignore")
 
@@ -224,7 +225,7 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     if not is_main: return 0.0
 
     model.eval()
-    all_y_true, all_y_score, all_y_pred = [], [], []
+    all_y_true, all_y_score = [], []
     
     TP, TN, FP, FN = 0, 0, 0, 0
     correct_count, total_samples = 0, 0
@@ -248,7 +249,6 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
             
             all_y_true.append(label_int)
             all_y_score.append(prob)
-            all_y_pred.append(pred_int)
             
             if pred_int == label_int: 
                 correct_count += 1
@@ -259,34 +259,32 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
             else:
                 if pred_int == 1: FP += 1
                 else: TN += 1
-                
             total_samples += 1
 
+    # محاسبه متریک‌ها
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
-    prec = TP / (TP + FP) if (TP + FP) > 0 else 0
-    rec = TP / (TP + FN) if (TP + FN) > 0 else 0
-    spec = TN / (TN + FP) if (TN + FP) > 0 else 0
-
+    
+    # محاسبه AUC
+    auc_score = roc_auc_score(all_y_true, all_y_score)
+    
     if is_ensemble:
         print(f"\n{'='*70}")
         print(f"FINAL RESULTS - {model_name}")
+        print(f"AUC Score: {auc_score:.4f}") # چاپ مقدار AUC
         print(f"{'='*70}")
-        print(f"Precision: {prec:.4f} | Recall: {rec:.4f} | Specificity: {spec:.4f}")
-        print(f"Confusion Matrix:\n                 Predicted Real  Predicted Fake")
-        print(f"    Actual Real      {TP:<15} {FN:<15}")
-        print(f"    Actual Fake      {FP:<15} {TN:<15}")
-        print(f"Correct: {correct_count} ({acc*100:.2f}%) | Incorrect: {total - correct_count} ({(1-acc)*100:.2f}%)")
-        print("="*70)
-
+        # ... بقیه کدهای نمایش ...
+        
+        # ذخیره در JSON
         roc_json_path = os.path.join(save_dir, "roc_data_test.json")
         roc_data_json = {
-            "metadata": {"dataset": args.dataset_type, "num_samples": int(total_samples), "model": "paper_kd_ensemble"},
-            "y_true": all_y_true, "y_score": all_y_score, "y_pred": all_y_pred
+            "metadata": {"dataset": args.dataset_type, "auc": float(auc_score), "model": "paper_kd_ensemble"},
+            "y_true": all_y_true, 
+            "y_score": all_y_score
         }
         with open(roc_json_path, 'w', encoding='utf-8') as f: 
             json.dump(roc_data_json, f, indent=2)
-        print(f"✅ ROC data saved to: {roc_json_path}")
+        print(f"✅ ROC data (including AUC) saved to: {roc_json_path}")
 
     return acc * 100
 
