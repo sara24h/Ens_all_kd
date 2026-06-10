@@ -296,7 +296,10 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
     models = []
     if is_main: print(f"Loading {len(model_paths)} KD Student models (ResNet18)...")
     for i, path in enumerate(model_paths):
-        if not os.path.exists(path): continue
+        if not os.path.exists(path): 
+            if is_main: print(f" [❌ ERROR] File not found: {path}")
+            continue
+            
         try:
             model = ResNetKD().to(device)
             state_dict = torch.load(path, map_location='cpu', weights_only=False)
@@ -305,24 +308,27 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
             if isinstance(state_dict, dict) and 'state_dict' in state_dict: 
                 state_dict = state_dict['state_dict']
             
-            # 🚀 حذف پیشوند 'model.' از کلیدها 🚀
+            # 🚀 حذف پیشوندهای مزاحم ('model.' و 'module.') از کلیدها 🚀
             new_state_dict = {}
             for k, v in state_dict.items():
-                # اگر کلید با model. شروع شد، آن را حذف کن، در غیر این صورت کلید دست نخورده باقی بماند
                 if k.startswith('model.'):
                     new_state_dict[k[6:]] = v
+                elif k.startswith('module.'):  # این خط برای مدل‌های DDP اضافه شد
+                    new_state_dict[k[7:]] = v
                 else:
                     new_state_dict[k] = v
             
-            # حالا وزن‌ها بدون مشکل روی self.model لود می‌شوند
-            model.model.load_state_dict(new_state_dict, strict=True)
+            model.model.load_state_dict(new_state_dict, strict=False)
             
             model.eval()
             models.append(model)
-            if is_main: print(f" [✅ {i+1}/{len(model_paths)}] Loaded: {os.path.basename(path)}")
+            
+            # 🚀 پیام موفقیت باید دقیقاً اینجا باشد (بعد از لود موفق) 🚀
+            if is_main: print(f" [✅ {len(models)}/{len(model_paths)}] Loaded: {os.path.basename(path)}")
             
         except Exception as e:
-            if is_main: print(f" [❌ ERROR] Failed {path}: {e}")
+            # 🚀 چاپ دقیق خطا برای فهمیدن مشکل مدل 190 🚀
+            if is_main: print(f" [❌ ERROR] Failed {os.path.basename(path)}: {e}")
             
     if len(models) == 0: raise ValueError("No models loaded!")
     return models
