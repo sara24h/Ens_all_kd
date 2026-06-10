@@ -194,29 +194,29 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 class PaperKDEnsemble(nn.Module):
-    def __init__(self, models: List[nn.Module], means: List[Tuple[float]], stds: List[Tuple[float]]):
+    def __init__(self, models, means, stds):
         super().__init__()
-        self.num_models = len(models)
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
 
-    def forward(self, x: torch.Tensor, return_details: bool = False):
-        outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
-        for i in range(self.num_models):
+    def forward(self, x):
+        # 1. گرفتن لاجیت‌ها برای هر مدل (بدون سیگموئید)
+        logits_list = []
+        for i in range(len(self.models)):
             x_n = self.normalizations(x, i)
-            with torch.no_grad():
-                out = self.models[i](x_n)
-                if isinstance(out, (tuple, list)): out = out[0]
-                if out.dim() == 1: out = out.unsqueeze(1)
-            outputs[:, i] = out
+            out = self.models[i](x_n)
+            if isinstance(out, (tuple, list)): out = out[0]
+            logits_list.append(out)
         
-        probs = torch.sigmoid(outputs)
-        final_output = probs.mean(dim=1)
+        # 2. جمع لاجیت‌ها طبق فرمول 9 مقاله (Logit Summation)
+        # sum of logits: z_total = z1 + z2 + z3
+        summed_logits = torch.stack(logits_list, dim=0).sum(dim=0)
         
-        if return_details:
-            weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
-            return final_output, weights, None, outputs
-        return final_output, None
+        # 3. اعمال Sigmoid تنها در مرحله نهایی (برای داشتن احتمال)
+        # تصمیم نهایی: اگر summed_logits > 0 باشد، کلاس مثبت است
+        final_probs = torch.sigmoid(summed_logits)
+        
+        return final_probs, None
 
 # ================== UNIFIED FINAL EVALUATION (بدون تغییر) ==================
 @torch.no_grad()
