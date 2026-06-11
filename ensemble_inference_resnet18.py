@@ -18,7 +18,7 @@ from sklearn.metrics import roc_auc_score
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 0. Dataset Utilities (بدون تغییر - دقیقا همانی که خودتون داشتید)
+# 0. Dataset Utilities (بدون تغییر)
 # ==========================================
 class TransformSubset(Subset):
     def __init__(self, dataset, indices, transform):
@@ -170,7 +170,7 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_dis
 
 
 # ==========================================
-# 1. Models (اصلاح شده)
+# 1. Models (بدون تغییر)
 # ==========================================
 class ResNetKD(nn.Module):
     def __init__(self):
@@ -201,7 +201,6 @@ class PaperKDEnsemble(nn.Module):
         self.normalizations = MultiModelNormalization(means, stds)
 
     def forward(self, x):
-        # 1. گرفتن لاجیت‌ها برای هر مدل (بدون سیگموئید)
         logits_list = []
         for i in range(len(self.models)):
             x_n = self.normalizations(x, i)
@@ -209,20 +208,15 @@ class PaperKDEnsemble(nn.Module):
             if isinstance(out, (tuple, list)): out = out[0]
             logits_list.append(out)
         
-        # 2. جمع لاجیت‌ها طبق فرمول 9 مقاله (Logit Summation)
-        # sum of logits: z_total = z1 + z2 + z3
         summed_logits = torch.stack(logits_list, dim=0).sum(dim=0)
-        
-        # 3. اعمال Sigmoid تنها در مرحله نهایی (برای داشتن احتمال)
-        # تصمیم نهایی: اگر summed_logits > 0 باشد، کلاس مثبت است
         final_probs = torch.sigmoid(summed_logits)
         
         return final_probs, None
 
-# ================== UNIFIED FINAL EVALUATION (بدون تغییر) ==================
+# ================== UNIFIED FINAL EVALUATION (افزوده شده: Precision, Recall, F1) ==================
 @torch.no_grad()
 def final_evaluation_unified(model, test_loader, device, save_dir, model_name, args, is_main, is_ensemble=True):
-    if not is_main: return 0.0
+    if not is_main: return 0.0, 0.0, 0.0, 0.0
 
     model.eval()
     all_y_true, all_y_score = [], []
@@ -253,10 +247,10 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
             if pred_int == label_int: 
                 correct_count += 1
             
-            if label_int == 1:
+            if label_int == 1:  # Real = 1
                 if pred_int == 1: TP += 1
                 else: FN += 1
-            else:
+            else:               # Fake = 0
                 if pred_int == 1: FP += 1
                 else: TN += 1
             total_samples += 1
@@ -265,31 +259,45 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
     
+    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+    recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    
     # محاسبه AUC
     auc_score = roc_auc_score(all_y_true, all_y_score)
     
     if is_ensemble:
         print(f"\n{'='*70}")
         print(f"FINAL RESULTS - {model_name}")
-        print(f"AUC Score: {auc_score:.4f}") # چاپ مقدار AUC
+        print(f"Accuracy:  {acc*100:.2f}%")
+        print(f"Precision: {precision:.4f} (دفقت در تشخیص Real)")
+        print(f"Recall:    {recall:.4f} (حساسیت در تشخیص Real)")
+        print(f"F1-Score:  {f1_score:.4f}")
+        print(f"AUC Score: {auc_score:.4f}")
         print(f"{'='*70}")
-        # ... بقیه کدهای نمایش ...
         
         # ذخیره در JSON
         roc_json_path = os.path.join(save_dir, "roc_data_test.json")
         roc_data_json = {
-            "metadata": {"dataset": args.dataset_type, "auc": float(auc_score), "model": "paper_kd_ensemble"},
+            "metadata": {
+                "dataset": args.dataset_type, 
+                "auc": float(auc_score), 
+                "accuracy": float(acc*100),
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1_score": float(f1_score),
+                "model": "paper_kd_ensemble"
+            },
             "y_true": all_y_true, 
             "y_score": all_y_score
         }
         with open(roc_json_path, 'w', encoding='utf-8') as f: 
             json.dump(roc_data_json, f, indent=2)
-        print(f"✅ ROC data (including AUC) saved to: {roc_json_path}")
+        print(f"✅ ROC data (including metrics) saved to: {roc_json_path}")
 
-    return acc * 100
+    return acc * 100, precision, recall, f1_score
 
-# ================== MODEL LOADING (اصلاح شدیه - رفع مشکل کلیدها) ==================
-# ================== MODEL LOADING (رفع قطعی مشکل کلیدها) ==================
+# ================== MODEL LOADING (بدون تغییر) ==================
 def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     models = []
     if is_main: print(f"Loading {len(model_paths)} KD Student models (ResNet18)...")
@@ -302,16 +310,14 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
             model = ResNetKD().to(device)
             state_dict = torch.load(path, map_location='cpu', weights_only=False)
             
-            # اگر فایل داخل یک کلید state_dict ذخیره شده بود
             if isinstance(state_dict, dict) and 'state_dict' in state_dict: 
                 state_dict = state_dict['state_dict']
             
-            # 🚀 حذف پیشوندهای مزاحم ('model.' و 'module.') از کلیدها 🚀
             new_state_dict = {}
             for k, v in state_dict.items():
                 if k.startswith('model.'):
                     new_state_dict[k[6:]] = v
-                elif k.startswith('module.'):  # این خط برای مدل‌های DDP اضافه شد
+                elif k.startswith('module.'):  
                     new_state_dict[k[7:]] = v
                 else:
                     new_state_dict[k] = v
@@ -321,17 +327,15 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
             model.eval()
             models.append(model)
             
-            # 🚀 پیام موفقیت باید دقیقاً اینجا باشد (بعد از لود موفق) 🚀
             if is_main: print(f" [✅ {len(models)}/{len(model_paths)}] Loaded: {os.path.basename(path)}")
             
         except Exception as e:
-            # 🚀 چاپ دقیق خطا برای فهمیدن مشکل مدل 190 🚀
             if is_main: print(f" [❌ ERROR] Failed {os.path.basename(path)}: {e}")
             
     if len(models) == 0: raise ValueError("No models loaded!")
     return models
 
-# ================== MAIN FUNCTION (اصلاح شده برای اجرای تک‌کارت گرافیک) ==================
+# ================== MAIN FUNCTION (افزوده شده متریک‌ها به مدل‌های تکی و مقایسه نهایی) ==================
 def main():
     parser = argparse.ArgumentParser(description="Paper KD Ensemble")
     parser.add_argument('--batch_size', type=int, default=32)
@@ -344,12 +348,10 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
-    # 🚀 تنظیم خودکار کارت گرافیک بدون نیاز به torchrun 🚀
     if torch.cuda.is_available():
         device = torch.device('cuda:0')
         is_main = True
         rank, world_size, local_rank = 0, 1, 0
-        # نیازی به مقداردهی محیطی distributed نیست
     else:
         device = torch.device('cpu')
         is_main = True
@@ -378,9 +380,10 @@ def main():
         print("="*70)
         
         individual_accs = []
+        individual_f1s = []
+        
         for i, model in enumerate(base_models):
-            correct = 0
-            total = 0
+            TP, TN, FP, FN = 0, 0, 0, 0
             model.eval()
             with torch.no_grad():
                 for images, labels in test_loader:
@@ -388,15 +391,31 @@ def main():
                     out = model(normalizations(images, i))
                     if isinstance(out, (tuple, list)): out = out[0]
                     pred = (torch.sigmoid(out.squeeze()) > 0.5).long()
-                    correct += pred.eq(labels.long()).sum().item()
-                    total += labels.size(0)
-            acc = 100. * correct / total
-            individual_accs.append(acc)
-            print(f" Model {i+1} ({MODEL_NAMES[i]}): {acc:.2f}%")
+                    
+                    # محاسبه ماتریس درهم‌ریختگی برای هر مدل تکی
+                    labels_cpu = labels.long().cpu()
+                    pred_cpu = pred.cpu()
+                    
+                    TP += ((pred_cpu == 1) & (labels_cpu == 1)).sum().item()
+                    TN += ((pred_cpu == 0) & (labels_cpu == 0)).sum().item()
+                    FP += ((pred_cpu == 1) & (labels_cpu == 0)).sum().item()
+                    FN += ((pred_cpu == 0) & (labels_cpu == 1)).sum().item()
 
-        best_single = max(individual_accs)
-        best_idx = individual_accs.index(best_single)
-        print(f"\nBest Single Model: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+            total = TP + TN + FP + FN
+            acc = (TP + TN) / total if total > 0 else 0
+            prec = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+            rec = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+            f1 = 2 * (prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+            
+            individual_accs.append(acc * 100)
+            individual_f1s.append(f1)
+            print(f" Model {i+1} ({MODEL_NAMES[i]}): Acc={acc*100:.2f}% | Prec={prec:.4f} | Rec={rec:.4f} | F1={f1:.4f}")
+
+        best_single_idx = individual_accs.index(max(individual_accs))
+        best_single_acc = individual_accs[best_single_idx]
+        best_single_f1 = individual_f1s[best_single_idx]
+        
+        print(f"\nBest Single Model: Model {best_single_idx+1} ({MODEL_NAMES[best_single_idx]}) → Acc: {best_single_acc:.2f}% | F1: {best_single_f1:.4f}")
         print("="*70)
 
         print("\n" + "="*70)
@@ -405,7 +424,8 @@ def main():
         
         ensemble = PaperKDEnsemble(base_models, MEANS, STDS).to(device)
         
-        ensemble_acc = final_evaluation_unified(
+        # دریافت تمامی متریک‌ها از تابع ارزیابی
+        ensemble_acc, ensemble_prec, ensemble_rec, ensemble_f1 = final_evaluation_unified(
             ensemble, test_loader, device, args.save_dir, 
             "Paper KD Ensemble", args, is_main, is_ensemble=True
         )
@@ -413,16 +433,27 @@ def main():
         print("\n" + "="*70)
         print("FINAL COMPARISON")
         print("="*70)
-        print(f"Best Single Model: {best_single:.2f}%")
-        print(f"Ensemble Accuracy: {ensemble_acc:.2f}%")
-        print(f"Improvement: {ensemble_acc - best_single:+.2f}%")
+        print(f"Best Single Model: Acc={best_single_acc:.2f}% | F1={best_single_f1:.4f}")
+        print(f"Ensemble Model:    Acc={ensemble_acc:.2f}% | F1={ensemble_f1:.4f}")
+        print(f"Accuracy Improvement: {ensemble_acc - best_single_acc:+.2f}%")
+        print(f"F1-Score Improvement: {ensemble_f1 - best_single_f1:+.4f}")
         print("="*70)
 
         final_results = {
             'method': 'Paper_KD_Ensemble',
-            'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
-            'ensemble': {'test_accuracy': float(ensemble_acc)},
-            'improvement': float(ensemble_acc - best_single)
+            'best_single_model': {
+                'name': MODEL_NAMES[best_single_idx], 
+                'accuracy': float(best_single_acc),
+                'f1_score': float(best_single_f1)
+            },
+            'ensemble': {
+                'test_accuracy': float(ensemble_acc), 
+                'precision': float(ensemble_prec),
+                'recall': float(ensemble_rec),
+                'f1_score': float(ensemble_f1)
+            },
+            'accuracy_improvement': float(ensemble_acc - best_single_acc),
+            'f1_improvement': float(ensemble_f1 - best_single_f1)
         }
         with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
             json.dump(final_results, f, indent=4)
