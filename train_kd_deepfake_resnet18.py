@@ -60,13 +60,23 @@ class Dataset_selector:
             mean, std = (0.4668, 0.3816, 0.3414), (0.2410, 0.2161, 0.2081)
 
         transform_train = transforms.Compose([
-            transforms.Resize(image_size), transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(10), transforms.ColorJitter(brightness=0.1, contrast=0.1),
-            transforms.ToTensor(), transforms.Normalize(mean=mean, std=std),
-        ])
+            transforms.Resize((256, 256)),          # تغییر سایز مستقیم (حفظ لبه‌های چهره)
+            transforms.RandomHorizontalFlip(p=0.5), # آگمنتیشن افقی
+            transforms.RandomRotation(degrees=10),   # آگمنتیشن چرخش
+            transforms.ColorJitter(
+                brightness=0.2, 
+                contrast=0.2, 
+                saturation=0.1, 
+                hue=0.05
+            ),                                      # ✅ پرانتز ColorJitter اینجا بسته شد
+            transforms.ToTensor(),                  # تبدیل به تانسور [0, 1]
+            transforms.Normalize(mean, std)         # ✅ اعمال نرمال‌سازی بر اساس دیتاست انتخابی
+        ]) 
+
         transform_test = transforms.Compose([
-            transforms.Resize(image_size), transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
+            transforms.Resize((256, 256)),          # یکسان‌سازی ابعاد در تست و ولیدیشن
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std)         # ✅ اعمال نرمال‌سازی در تست و ولیدیشن
         ])
 
         img_column = 'path' if dataset_mode in ['140k'] else 'images_id'
