@@ -54,16 +54,29 @@ def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15,
     return train_indices, val_indices, test_indices
 
 def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_distributed=False):
-    val_test_transform = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(256), transforms.ToTensor()])
-    train_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.RandomCrop(256),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(10),
-        transforms.ColorJitter(0.2, 0.2),
-        transforms.ToTensor(),
+    # ✅ ۱. ترنسفورم ولیدیشن و تست: تغییر سایز مستقیم به (256, 256) بدون CenterCrop
+    val_test_transform = transforms.Compose([
+        transforms.Resize((256, 256)), 
+        transforms.ToTensor()
     ])
     
+    # ✅ ۲. ترنسفورم آموزش: حذف RandomCrop، تغییر سایز مستقیم و تنظیم دقیق آگمنتیشن‌ها مطابق روش اول
+    train_transform = transforms.Compose([
+        transforms.Resize((256, 256)),          # تغییر سایز مستقیم (حفظ لبه‌های چهره)
+        transforms.RandomHorizontalFlip(p=0.5), # آگمنتیشن افقی
+        transforms.RandomRotation(degrees=10),   # آگمنتیشن چرخش
+        transforms.ColorJitter(
+            brightness=0.2, 
+            contrast=0.2, 
+            saturation=0.1, 
+            hue=0.05
+        ),                                      # تنظیم دقیق پارامترهای رنگ جتر
+        transforms.ToTensor(),                  # تبدیل به تانسور [0, 1] (بدون اعمال خطی نرمالایز)
+    ])
+    
+    # =========================================================================
+    # مابقی منطق مدیریت دیتاست‌ها (بدون تغییر نسبت به نسخه قبل شما برای حفظ سازگاری)
+    # =========================================================================
     dataset_paths = {
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
