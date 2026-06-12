@@ -214,15 +214,25 @@ class PaperKDEnsemble(nn.Module):
         self.normalizations = MultiModelNormalization(means, stds)
 
     def forward(self, x):
-        logits_list = []
+        probs_list = []
         for i in range(len(self.models)):
+            # 1. اعمال نرمال‌سازی مخصوص هر مدل
             x_n = self.normalizations(x, i)
+            
+            # 2. دریافت خروجی خام مدل (Logits)
             out = self.models[i](x_n)
-            if isinstance(out, (tuple, list)): out = out[0]
-            logits_list.append(out)
+            if isinstance(out, (tuple, list)): 
+                out = out[0]
+            
+            # 3. تبدیل خروجی خام به احتمال (Probability) با Sigmoid
+            # استفاده از float() برای جلوگیری از مشکلات احتمالی با Mixed Precision (fp16)
+            prob = torch.sigmoid(out.float()) 
+            probs_list.append(prob)
         
-        summed_logits = torch.stack(logits_list, dim=0).sum(dim=0)
-        final_probs = torch.sigmoid(summed_logits)
+        # 4. میانگین‌گیری از احتمالات (Standard Soft Voting)
+        # stack(..., dim=0) باعث میشه یک بُعد جدید برای مدل‌ها ساخته بشه
+        # mean(dim=0) میانگین احتمالات همه مدل‌ها رو برای هر نمونه دیتا حساب می‌کنه
+        final_probs = torch.mean(torch.stack(probs_list, dim=0), dim=0)
         
         return final_probs, None
 
