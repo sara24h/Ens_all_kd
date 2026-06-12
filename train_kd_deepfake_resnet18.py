@@ -30,10 +30,8 @@ class FaceDataset(Dataset):
 
     def __getitem__(self, idx):
         img_name = os.path.join(self.root_dir, self.data[self.img_column].iloc[idx])
-        if not os.path.exists(img_name):
-            image = Image.new('RGB', (256, 256))
-        else:
-            image = Image.open(img_name).convert('RGB')
+        
+        image = Image.open(img_name).convert('RGB')
             
         label = self.label_map[self.data['label'].iloc[idx]]
         if self.transform:
