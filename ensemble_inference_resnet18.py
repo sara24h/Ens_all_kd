@@ -10,15 +10,16 @@ from typing import List, Tuple
 import warnings
 import argparse
 import json
-import time
+import time  # <======= ۱. اضافه شدن ماژول زمان
 from sklearn.model_selection import train_test_split
 from PIL import Image
+import torch.distributed as dist
 from sklearn.metrics import roc_auc_score
 
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 0. Dataset Utilities (اصلاح شده برای PyTorch 2.2+)
+# 0. Dataset Utilities (بدون تغییر)
 # ==========================================
 class TransformSubset(Subset):
     def __init__(self, dataset, indices, transform):
@@ -35,10 +36,6 @@ class TransformSubset(Subset):
         if self.transform:
             img = self.transform(img)
         return img, label
-        
-    # ✅ رفع خطای NotImplementedError در PyTorch های جدید
-    def __getitems__(self, indices):
-        return [self.__getitem__(idx) for idx in indices]
 
 def get_sample_info(dataset, index):
     if hasattr(dataset, 'samples'):
@@ -58,19 +55,29 @@ def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15,
     return train_indices, val_indices, test_indices
 
 def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_distributed=False):
+    # ✅ ۱. ترنسفورم ولیدیشن و تست: تغییر سایز مستقیم به (256, 256) بدون CenterCrop
     val_test_transform = transforms.Compose([
         transforms.Resize((256, 256)), 
         transforms.ToTensor()
     ])
     
+    # ✅ ۲. ترنسفورم آموزش: حذف RandomCrop، تغییر سایز مستقیم و تنظیم دقیق آگمنتیشن‌ها مطابق روش اول
     train_transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(degrees=10),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05),
-        transforms.ToTensor(),
+        transforms.Resize((256, 256)),          # تغییر سایز مستقیم (حفظ لبه‌های چهره)
+        transforms.RandomHorizontalFlip(p=0.5), # آگمنتیشن افقی
+        transforms.RandomRotation(degrees=10),   # آگمنتیشن چرخش
+        transforms.ColorJitter(
+            brightness=0.2, 
+            contrast=0.2, 
+            saturation=0.1, 
+            hue=0.05
+        ),                                      # تنظیم دقیق پارامترهای رنگ جتر
+        transforms.ToTensor(),                  # تبدیل به تانسور [0, 1] (بدون اعمال خطی نرمالایز)
     ])
     
+    # =========================================================================
+    # مابقی منطق مدیریت دیتاست‌ها (بدون تغییر نسبت به نسخه قبل شما برای حفظ سازگاری)
+    # =========================================================================
     dataset_paths = {
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
@@ -92,7 +99,7 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_dis
             datasets_dict[split] = datasets.ImageFolder(path, transform=transform)
         
         test_dataset = datasets_dict['test']
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
         return test_loader, test_dataset, list(range(len(test_dataset)))
 
     elif dataset_type == 'uadfV':
@@ -121,7 +128,7 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_dis
         full_dataset = UADFVDataset(base_dir, transform=val_test_transform)
         _, _, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
         return test_loader, full_dataset, test_indices
 
     elif dataset_type in ['custom_genai', 'custom_genai_v2']:
@@ -148,7 +155,7 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_dis
         full_dataset = NewGenAIDataset(base_dir, transform=val_test_transform)
         _, _, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
         return test_loader, full_dataset, test_indices
 
     elif dataset_type in dataset_paths:
@@ -169,14 +176,15 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_dis
         train_indices, val_indices, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
         
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
         return test_loader, full_dataset, test_indices
     
     else:
         raise ValueError(f"Dataset type {dataset_type} not supported.")
 
+
 # ==========================================
-# 1. Models
+# 1. Models (بدون تغییر)
 # ==========================================
 class ResNetKD(nn.Module):
     def __init__(self):
@@ -188,7 +196,7 @@ class ResNetKD(nn.Module):
         return self.model(x)
 
 # ==========================================
-# 2. Normalization & Ensemble Classes
+# 2. Normalization & Ensemble Classes (بدون تغییر)
 # ==========================================
 class MultiModelNormalization(nn.Module):
     def __init__(self, means: List[Tuple[float]], stds: List[Tuple[float]]):
@@ -209,79 +217,78 @@ class PaperKDEnsemble(nn.Module):
     def forward(self, x):
         probs_list = []
         for i in range(len(self.models)):
+            # 1. اعمال نرمال‌سازی مخصوص هر مدل
             x_n = self.normalizations(x, i)
+            
+            # 2. دریافت خروجی خام مدل (Logits)
             out = self.models[i](x_n)
             if isinstance(out, (tuple, list)): 
                 out = out[0]
             
+            # 3. تبدیل خروجی خام به احتمال (Probability) با Sigmoid
+            # استفاده از float() برای جلوگیری از مشکلات احتمالی با Mixed Precision (fp16)
             prob = torch.sigmoid(out.float()) 
             probs_list.append(prob)
         
+        # 4. میانگین‌گیری از احتمالات (Standard Soft Voting)
+        # stack(..., dim=0) باعث میشه یک بُعد جدید برای مدل‌ها ساخته بشه
+        # mean(dim=0) میانگین احتمالات همه مدل‌ها رو برای هر نمونه دیتا حساب می‌کنه
         final_probs = torch.mean(torch.stack(probs_list, dim=0), dim=0)
+        
         return final_probs, None
 
-# ================== UNIFIED FINAL EVALUATION ==================
+# ================== UNIFIED FINAL EVALUATION (افزوده شده: Time, Precision, Recall, F1) ==================
 @torch.no_grad()
 def final_evaluation_unified(model, test_loader, device, save_dir, model_name, args, is_main, is_ensemble=True):
     if not is_main: return 0.0, 0.0, 0.0, 0.0, {}
 
     model.eval()
     all_y_true, all_y_score = [], []
+    
     TP, TN, FP, FN = 0, 0, 0, 0
     correct_count, total_samples = 0, 0
 
     print(f"\nRunning Fast Batch Evaluation on {len(test_loader.dataset)} samples for [{model_name}]...")
     
-    # ======= WARMUP =======
-    print("Warming up GPU...", end=" ")
-    for images, _ in test_loader:
-        images = images.to(device, non_blocking=True)
-        with torch.cuda.amp.autocast():
-            if is_ensemble:
-                _ = model(images)
-            else:
-                _ = model(images)
-        break
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    print("Done!")
-    # =======================
-
+    # ======= ۲. شروع زمان‌سنجی =======
     if device.type == 'cuda':
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
     else:
         start_time = time.time()
+    # =====================================
 
-    for images, labels in tqdm(test_loader, desc=f"Eval {model_name}", leave=False):
-        images = images.to(device, non_blocking=True)
+    for images, labels in tqdm(test_loader, desc=f"Eval {model_name}"):
+        images = images.to(device)
         labels_int = labels.long().tolist()
         
-        with torch.cuda.amp.autocast():
-            if is_ensemble:
-                final_output, _ = model(images)
-                probs = final_output.squeeze(1).float().cpu().tolist()
-            else:
-                output = model(images)
-                if isinstance(output, (tuple, list)): output = output[0]
-                probs = torch.sigmoid(output.squeeze(1)).float().cpu().tolist()
+        if is_ensemble:
+            final_output, _ = model(images)
+            probs = final_output.squeeze(1).cpu().tolist()
+        else:
+            output = model(images)
+            if isinstance(output, (tuple, list)): output = output[0]
+            probs = torch.sigmoid(output.squeeze(1)).cpu().tolist()
             
         for prob, label_int in zip(probs, labels_int):
             pred_int = int(prob > 0.5)
+            
             all_y_true.append(label_int)
             all_y_score.append(prob)
             
-            if pred_int == label_int: correct_count += 1
+            if pred_int == label_int: 
+                correct_count += 1
             
-            if label_int == 1:  
+            if label_int == 1:  # Real = 1
                 if pred_int == 1: TP += 1
                 else: FN += 1
-            else:               
+            else:               # Fake = 0
                 if pred_int == 1: FP += 1
                 else: TN += 1
             total_samples += 1
 
+    # ======= ۳. توقف و محاسبه زمان استنتاج =======
     if device.type == 'cuda':
         end_event.record()
         torch.cuda.synchronize()
@@ -292,22 +299,30 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     total_real_samples = len(test_loader.dataset)
     avg_time_per_sample_ms = total_inference_time_ms / total_real_samples if total_real_samples > 0 else 0
     fps = 1000.0 / avg_time_per_sample_ms if avg_time_per_sample_ms > 0 else 0
+    # ================================================
 
+    # محاسبه متریک‌ها
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
+    
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
     f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    # محاسبه AUC
     auc_score = roc_auc_score(all_y_true, all_y_score)
     
     if is_ensemble:
         print(f"\n{'='*70}")
         print(f"FINAL RESULTS - {model_name}")
         print(f"{'='*70}")
+        
+        # چاپ زمان استنتاج
         print(f"\nInference Time Statistics:")
         print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
         print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
         print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
+        
         print(f"\nAccuracy:  {acc*100:.2f}%")
         print(f"Precision: {precision:.4f} (دفقت در تشخیص Real)")
         print(f"Recall:    {recall:.4f} (حساسیت در تشخیص Real)")
@@ -315,12 +330,14 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
         print(f"AUC Score: {auc_score:.4f}")
         print(f"{'='*70}")
         
+        # آمار سرعت
         inference_stats = {
             'total_time_sec': float(total_inference_time_ms / 1000),
             'avg_time_per_sample_ms': float(avg_time_per_sample_ms),
             'fps': float(fps)
         }
 
+        # ذخیره در JSON
         roc_json_path = os.path.join(save_dir, "roc_data_test.json")
         roc_data_json = {
             "metadata": {
@@ -331,18 +348,18 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
                 "recall": float(recall),
                 "f1_score": float(f1_score),
                 "model": "paper_kd_ensemble",
-                "inference_stats": inference_stats
+                "inference_stats": inference_stats  # <======= اضافه شدن به JSON
             },
             "y_true": all_y_true, 
             "y_score": all_y_score
         }
         with open(roc_json_path, 'w', encoding='utf-8') as f: 
             json.dump(roc_data_json, f, indent=2)
-        print(f"✅ ROC data saved to: {roc_json_path}")
+        print(f"✅ ROC data (including metrics & time) saved to: {roc_json_path}")
 
     return acc * 100, precision, recall, f1_score, inference_stats
 
-# ================== MODEL LOADING ==================
+# ================== MODEL LOADING (بدون تغییر) ==================
 def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     models = []
     if is_main: print(f"Loading {len(model_paths)} KD Student models (ResNet18)...")
@@ -368,8 +385,10 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
                     new_state_dict[k] = v
             
             model.model.load_state_dict(new_state_dict, strict=False)
+            
             model.eval()
             models.append(model)
+            
             if is_main: print(f" [✅ {len(models)}/{len(model_paths)}] Loaded: {os.path.basename(path)}")
             
         except Exception as e:
@@ -378,10 +397,10 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
     if len(models) == 0: raise ValueError("No models loaded!")
     return models
 
-# ================== MAIN FUNCTION ==================
+# ================== MAIN FUNCTION (افزوده شده متریک‌ها به مدل‌های تکی و مقایسه نهایی) ==================
 def main():
-    parser = argparse.ArgumentParser(description="Paper KD Ensemble - GPU Optimized")
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser = argparse.ArgumentParser(description="Paper KD Ensemble")
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--dataset_type', type=str, required=True, 
                         choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV', 'real_fake_dataset', 'deepfake_lab'])
     parser.add_argument('--data_dir', type=str, required=True)
@@ -389,19 +408,16 @@ def main():
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output_kd')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gpu_id', type=int, default=0, help="ID of the GPU to use (e.g., 0 for cuda:0)")
     args = parser.parse_args()
 
     if torch.cuda.is_available():
-        device = torch.device(f'cuda:{args.gpu_id}')
-        torch.cuda.set_device(device)
-        print(f"🚀 Using GPU: {torch.cuda.get_device_name(device)}")
+        device = torch.device('cuda:0')
+        is_main = True
+        rank, world_size, local_rank = 0, 1, 0
     else:
         device = torch.device('cpu')
-        print("⚠️ WARNING: CUDA not available. Falling back to CPU!")
-    
-    is_main = True
-    rank, world_size, local_rank = 0, 1, 0
+        is_main = True
+        rank, world_size, local_rank = 0, 1, 0
 
     if len(args.model_names) != len(args.models):
         raise ValueError("Number of model_names must match model_paths")
@@ -433,13 +449,12 @@ def main():
             model.eval()
             with torch.no_grad():
                 for images, labels in test_loader:
-                    images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+                    images, labels = images.to(device), labels.to(device)
+                    out = model(normalizations(images, i))
+                    if isinstance(out, (tuple, list)): out = out[0]
+                    pred = (torch.sigmoid(out.squeeze()) > 0.5).long()
                     
-                    with torch.cuda.amp.autocast():
-                        out = model(normalizations(images, i))
-                        if isinstance(out, (tuple, list)): out = out[0]
-                        pred = (torch.sigmoid(out.squeeze()).float() > 0.5).long()
-                    
+                    # محاسبه ماتریس درهم‌ریختگی برای هر مدل تکی
                     labels_cpu = labels.long().cpu()
                     pred_cpu = pred.cpu()
                     
@@ -462,7 +477,7 @@ def main():
         best_single_acc = individual_accs[best_single_idx]
         best_single_f1 = individual_f1s[best_single_idx]
         
-        print(f"\nBest Single Model: Model {best_single_idx+1} ({MODEL_NAMES[best_single_idx]}) -> Acc: {best_single_acc:.2f}% | F1: {best_single_f1:.4f}")
+        print(f"\nBest Single Model: Model {best_single_idx+1} ({MODEL_NAMES[best_single_idx]}) → Acc: {best_single_acc:.2f}% | F1: {best_single_f1:.4f}")
         print("="*70)
 
         print("\n" + "="*70)
@@ -471,6 +486,7 @@ def main():
         
         ensemble = PaperKDEnsemble(base_models, MEANS, STDS).to(device)
         
+        # دریافت تمامی متریک‌ها و زمان استنتاج از تابع ارزیابی
         ensemble_acc, ensemble_prec, ensemble_rec, ensemble_f1, inference_stats = final_evaluation_unified(
             ensemble, test_loader, device, args.save_dir, 
             "Paper KD Ensemble", args, is_main, is_ensemble=True
@@ -486,7 +502,7 @@ def main():
         print("="*70)
 
         final_results = {
-            'method': 'Paper_KD_Ensemble_GPU_Optimized',
+            'method': 'Paper_KD_Ensemble',
             'best_single_model': {
                 'name': MODEL_NAMES[best_single_idx], 
                 'accuracy': float(best_single_acc),
@@ -500,7 +516,7 @@ def main():
             },
             'accuracy_improvement': float(ensemble_acc - best_single_acc),
             'f1_improvement': float(ensemble_f1 - best_single_f1),
-            'inference_stats': inference_stats
+            'inference_stats': inference_stats  # <======= اضافه شدن به فایل نتایج نهایی
         }
         with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
             json.dump(final_results, f, indent=4)
