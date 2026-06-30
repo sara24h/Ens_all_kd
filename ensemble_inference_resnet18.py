@@ -18,7 +18,7 @@ from sklearn.metrics import roc_auc_score
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 0. Dataset Utilities (بدون تغییر)
+# 0. Dataset Utilities (اصلاح شده برای PyTorch 2.2+)
 # ==========================================
 class TransformSubset(Subset):
     def __init__(self, dataset, indices, transform):
@@ -35,6 +35,10 @@ class TransformSubset(Subset):
         if self.transform:
             img = self.transform(img)
         return img, label
+        
+    # ✅ رفع خطای NotImplementedError در PyTorch های جدید
+    def __getitems__(self, indices):
+        return [self.__getitem__(idx) for idx in indices]
 
 def get_sample_info(dataset, index):
     if hasattr(dataset, 'samples'):
@@ -88,7 +92,7 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_dis
             datasets_dict[split] = datasets.ImageFolder(path, transform=transform)
         
         test_dataset = datasets_dict['test']
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True) # افزایش num_workers برای GPU
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
         return test_loader, test_dataset, list(range(len(test_dataset)))
 
     elif dataset_type == 'uadfV':
@@ -210,14 +214,13 @@ class PaperKDEnsemble(nn.Module):
             if isinstance(out, (tuple, list)): 
                 out = out[0]
             
-            # تبدیل به float32 قبل از sigmoid برای جلوگیری از خطای FP16
             prob = torch.sigmoid(out.float()) 
             probs_list.append(prob)
         
         final_probs = torch.mean(torch.stack(probs_list, dim=0), dim=0)
         return final_probs, None
 
-# ================== UNIFIED FINAL EVALUATION (بهینه شده برای GPU با AMP و Warmup) ==================
+# ================== UNIFIED FINAL EVALUATION ==================
 @torch.no_grad()
 def final_evaluation_unified(model, test_loader, device, save_dir, model_name, args, is_main, is_ensemble=True):
     if not is_main: return 0.0, 0.0, 0.0, 0.0, {}
@@ -229,8 +232,7 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
 
     print(f"\nRunning Fast Batch Evaluation on {len(test_loader.dataset)} samples for [{model_name}]...")
     
-    # ======= WARMUP (گرم کردن GPU) =======
-    # بدون Warmup، سرعت در بچ اول به شدت پایین ثبت می‌شود
+    # ======= WARMUP =======
     print("Warming up GPU...", end=" ")
     for images, _ in test_loader:
         images = images.to(device, non_blocking=True)
@@ -243,23 +245,19 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     if device.type == 'cuda':
         torch.cuda.synchronize()
     print("Done!")
-    # =======================================
+    # =======================
 
-    # ======= شروع زمان‌سنجی دقیق =======
     if device.type == 'cuda':
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
     else:
         start_time = time.time()
-    # =======================================
 
     for images, labels in tqdm(test_loader, desc=f"Eval {model_name}", leave=False):
-        # ارسال داده‌ها با non_blocking=True برای پنهان کردن latency انتقال داده
         images = images.to(device, non_blocking=True)
         labels_int = labels.long().tolist()
         
-        # استفاده از Autocast برای اجرای سریع‌تر روی GPU (Mixed Precision)
         with torch.cuda.amp.autocast():
             if is_ensemble:
                 final_output, _ = model(images)
@@ -276,18 +274,17 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
             
             if pred_int == label_int: correct_count += 1
             
-            if label_int == 1:  # Real
+            if label_int == 1:  
                 if pred_int == 1: TP += 1
                 else: FN += 1
-            else:               # Fake
+            else:               
                 if pred_int == 1: FP += 1
                 else: TN += 1
             total_samples += 1
 
-    # ======= توقف و محاسبه زمان استنتاج =======
     if device.type == 'cuda':
         end_event.record()
-        torch.cuda.synchronize() # صبر کردن تا پایان کار GPU
+        torch.cuda.synchronize()
         total_inference_time_ms = start_event.elapsed_time(end_event)
     else:
         total_inference_time_ms = (time.time() - start_time) * 1000.0
@@ -295,9 +292,7 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     total_real_samples = len(test_loader.dataset)
     avg_time_per_sample_ms = total_inference_time_ms / total_real_samples if total_real_samples > 0 else 0
     fps = 1000.0 / avg_time_per_sample_ms if avg_time_per_sample_ms > 0 else 0
-    # ================================================
 
-    # محاسبه متریک‌ها
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
@@ -386,7 +381,7 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Paper KD Ensemble - GPU Optimized")
-    parser.add_argument('--batch_size', type=int, default=64) # باچ سایز بالاتر برای GPU بهتر است
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--dataset_type', type=str, required=True, 
                         choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV', 'real_fake_dataset', 'deepfake_lab'])
     parser.add_argument('--data_dir', type=str, required=True)
@@ -397,14 +392,13 @@ def main():
     parser.add_argument('--gpu_id', type=int, default=0, help="ID of the GPU to use (e.g., 0 for cuda:0)")
     args = parser.parse_args()
 
-    # تنظیمات دقیق دستگاه
     if torch.cuda.is_available():
         device = torch.device(f'cuda:{args.gpu_id}')
         torch.cuda.set_device(device)
         print(f"🚀 Using GPU: {torch.cuda.get_device_name(device)}")
     else:
         device = torch.device('cpu')
-        print("⚠️ WARNING: CUDA not available. Falling back to CPU (This will be slow!).")
+        print("⚠️ WARNING: CUDA not available. Falling back to CPU!")
     
     is_main = True
     rank, world_size, local_rank = 0, 1, 0
@@ -441,7 +435,6 @@ def main():
                 for images, labels in test_loader:
                     images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
                     
-                    # استفاده از AMP برای مدل‌های تکی
                     with torch.cuda.amp.autocast():
                         out = model(normalizations(images, i))
                         if isinstance(out, (tuple, list)): out = out[0]
