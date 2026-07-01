@@ -37,9 +37,6 @@ class TransformSubset(Subset):
             img = self.transform(img)
         return img, label
 
-    def __getitems__(self, indices):
-        return [self.__getitem__(idx) for idx in indices]
-
 def get_sample_info(dataset, index):
     if hasattr(dataset, 'samples'):
         return dataset.samples[index]
@@ -224,7 +221,7 @@ class PaperKDEnsemble(nn.Module):
         final_probs = torch.mean(torch.stack(probs_list, dim=0), dim=0)
         return final_probs, None
 
-# ================== UNIFIED FINAL EVALUATION (دقت ۱۰۰٪ مشابه) ==================
+# ================== UNIFIED FINAL EVALUATION (بدون warmup) ==================
 @torch.no_grad()
 def final_evaluation_unified(model, test_loader, device, save_dir, model_name, args, is_main, is_ensemble=True):
     if not is_main: return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -234,13 +231,6 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     
     TP, TN, FP, FN = 0, 0, 0, 0
     correct_count, total_samples = 0, 0
-
-    # ✅ وارم‌آپ با tensor ثابت (بدون تغییر RNG state و بدون مصرف batch)
-    if device.type == 'cuda':
-        dummy_input = torch.ones(1, 3, 256, 256, device=device)
-        for _ in range(3):
-            _ = model(dummy_input)
-        torch.cuda.synchronize()
 
     total_inference_time_ms = 0.0
 
