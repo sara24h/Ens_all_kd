@@ -10,6 +10,7 @@ from typing import List, Tuple
 import warnings
 import argparse
 import json
+import time
 from sklearn.model_selection import train_test_split
 from PIL import Image
 import torch.distributed as dist
@@ -236,10 +237,10 @@ class PaperKDEnsemble(nn.Module):
         
         return final_probs, None
 
-# ================== UNIFIED FINAL EVALUATION (افزوده شده: Precision, Recall, F1) ==================
+# ================== UNIFIED FINAL EVALUATION (فقط inference time اضافه شده) ==================
 @torch.no_grad()
 def final_evaluation_unified(model, test_loader, device, save_dir, model_name, args, is_main, is_ensemble=True):
-    if not is_main: return 0.0, 0.0, 0.0, 0.0
+    if not is_main: return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     model.eval()
     all_y_true, all_y_score = [], []
@@ -247,12 +248,30 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     TP, TN, FP, FN = 0, 0, 0, 0
     correct_count, total_samples = 0, 0
 
+    # ======= وارم‌آپ قبل از اندازه‌گیری زمان (فقط GPU) =======
+    if device.type == 'cuda':
+        dummy_input = torch.randn(1, 3, 256, 256).to(device)
+        for _ in range(5):
+            _ = model(dummy_input)
+        torch.cuda.synchronize()
+    # ========================================================
+
+    total_inference_time_ms = 0.0
+
     print(f"\nRunning Fast Batch Evaluation on {len(test_loader.dataset)} samples for [{model_name}]...")
     
     for images, labels in tqdm(test_loader, desc=f"Eval {model_name}"):
         images = images.to(device)
         labels_int = labels.long().tolist()
         
+        # ======= اندازه‌گیری زمان فقط دور forward pass =======
+        if device.type == 'cuda':
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        else:
+            start_time = time.time()
+
         if is_ensemble:
             final_output, _ = model(images)
             probs = final_output.squeeze(1).cpu().tolist()
@@ -260,6 +279,14 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
             output = model(images)
             if isinstance(output, (tuple, list)): output = output[0]
             probs = torch.sigmoid(output.squeeze(1)).cpu().tolist()
+            
+        if device.type == 'cuda':
+            end_event.record()
+            torch.cuda.synchronize()
+            total_inference_time_ms += start_event.elapsed_time(end_event)
+        else:
+            total_inference_time_ms += (time.time() - start_time) * 1000.0
+        # ========================================================
             
         for prob, label_int in zip(probs, labels_int):
             pred_int = int(prob > 0.5)
@@ -277,6 +304,10 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
                 if pred_int == 1: FP += 1
                 else: TN += 1
             total_samples += 1
+
+    # محاسبه میانگین زمان و FPS
+    avg_time_per_sample_ms = total_inference_time_ms / total_samples if total_samples > 0 else 0
+    fps = 1000.0 / avg_time_per_sample_ms if avg_time_per_sample_ms > 0 else 0
 
     # محاسبه متریک‌ها
     total = TP + TN + FP + FN
@@ -297,6 +328,13 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
         print(f"Recall:    {recall:.4f} (حساسیت در تشخیص Real)")
         print(f"F1-Score:  {f1_score:.4f}")
         print(f"AUC Score: {auc_score:.4f}")
+        
+        # ✅ چاپ زمان استنتاج
+        print(f"\nInference Time Statistics (model forward pass only):")
+        print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
+        print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
+        print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
+        
         print(f"{'='*70}")
         
         # ذخیره در JSON
@@ -318,7 +356,8 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
             json.dump(roc_data_json, f, indent=2)
         print(f"✅ ROC data (including metrics) saved to: {roc_json_path}")
 
-    return acc * 100, precision, recall, f1_score
+    # ✅ بازگرداندن ۷ مقدار (۴ متریک اصلی + ۳ متریک زمانی)
+    return acc * 100, precision, recall, f1_score, total_inference_time_ms, avg_time_per_sample_ms, fps
 
 # ================== MODEL LOADING (بدون تغییر) ==================
 def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
@@ -358,7 +397,7 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
     if len(models) == 0: raise ValueError("No models loaded!")
     return models
 
-# ================== MAIN FUNCTION (افزوده شده متریک‌ها به مدل‌های تکی و مقایسه نهایی) ==================
+# ================== MAIN FUNCTION (فقط inference time اضافه شده) ==================
 def main():
     parser = argparse.ArgumentParser(description="Paper KD Ensemble")
     parser.add_argument('--batch_size', type=int, default=32)
@@ -447,8 +486,8 @@ def main():
         
         ensemble = PaperKDEnsemble(base_models, MEANS, STDS).to(device)
         
-        # دریافت تمامی متریک‌ها از تابع ارزیابی
-        ensemble_acc, ensemble_prec, ensemble_rec, ensemble_f1 = final_evaluation_unified(
+        # ✅ دریافت ۷ خروجی از تابع ارزیابی
+        ensemble_acc, ensemble_prec, ensemble_rec, ensemble_f1, total_time, avg_time, fps = final_evaluation_unified(
             ensemble, test_loader, device, args.save_dir, 
             "Paper KD Ensemble", args, is_main, is_ensemble=True
         )
@@ -476,7 +515,13 @@ def main():
                 'f1_score': float(ensemble_f1)
             },
             'accuracy_improvement': float(ensemble_acc - best_single_acc),
-            'f1_improvement': float(ensemble_f1 - best_single_f1)
+            'f1_improvement': float(ensemble_f1 - best_single_f1),
+            # ✅ ذخیره آمار سرعت در فایل JSON
+            'inference_stats': {
+                'total_time_sec': float(total_time / 1000),
+                'avg_time_per_sample_ms': float(avg_time),
+                'fps': float(fps)
+            }
         }
         with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
             json.dump(final_results, f, indent=4)
