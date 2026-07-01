@@ -37,6 +37,9 @@ class TransformSubset(Subset):
             img = self.transform(img)
         return img, label
 
+    def __getitems__(self, indices):
+        return [self.__getitem__(idx) for idx in indices]
+
 def get_sample_info(dataset, index):
     if hasattr(dataset, 'samples'):
         return dataset.samples[index]
