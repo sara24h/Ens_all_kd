@@ -10,7 +10,7 @@ from typing import List, Tuple
 import warnings
 import argparse
 import json
-import time  # ✅ اضافه شده برای محاسبه زمان
+import time
 from sklearn.model_selection import train_test_split
 from PIL import Image
 import torch.distributed as dist
@@ -37,7 +37,6 @@ class TransformSubset(Subset):
             img = self.transform(img)
         return img, label
 
-    # ✅ اضافه شده برای سازگاری با PyTorch 2.6+
     def __getitems__(self, indices):
         return [self.__getitem__(idx) for idx in indices]
 
@@ -59,29 +58,24 @@ def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15,
     return train_indices, val_indices, test_indices
 
 def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_distributed=False):
-    # ✅ ۱. ترنسفورم ولیدیشن و تست: تغییر سایز مستقیم به (256, 256) بدون CenterCrop
     val_test_transform = transforms.Compose([
         transforms.Resize((256, 256)), 
         transforms.ToTensor()
     ])
     
-    # ✅ ۲. ترنسفورم آموزش: حذف RandomCrop، تغییر سایز مستقیم و تنظیم دقیق آگمنتیشن‌ها مطابق روش اول
     train_transform = transforms.Compose([
-        transforms.Resize((256, 256)),          # تغییر سایز مستقیم (حفظ لبه‌های چهره)
-        transforms.RandomHorizontalFlip(p=0.5), # آگمنتیشن افقی
-        transforms.RandomRotation(degrees=10),   # آگمنتیشن چرخش
+        transforms.Resize((256, 256)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(degrees=10),
         transforms.ColorJitter(
             brightness=0.2, 
             contrast=0.2, 
             saturation=0.1, 
             hue=0.05
-        ),                                      # تنظیم دقیق پارامترهای رنگ جتر
-        transforms.ToTensor(),                  # تبدیل به تانسور [0, 1] (بدون اعمال خطی نرمالایز)
+        ),
+        transforms.ToTensor(),
     ])
     
-    # =========================================================================
-    # مابقی منطق مدیریت دیتاست‌ها (بدون تغییر نسبت به نسخه قبل شما برای حفظ سازگاری)
-    # =========================================================================
     dataset_paths = {
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
@@ -186,7 +180,6 @@ def create_local_dataloaders(base_dir, batch_size, dataset_type, seed=42, is_dis
     else:
         raise ValueError(f"Dataset type {dataset_type} not supported.")
 
-
 # ==========================================
 # 1. Models (بدون تغییر)
 # ==========================================
@@ -221,27 +214,17 @@ class PaperKDEnsemble(nn.Module):
     def forward(self, x):
         probs_list = []
         for i in range(len(self.models)):
-            # 1. اعمال نرمال‌سازی مخصوص هر مدل
             x_n = self.normalizations(x, i)
-            
-            # 2. دریافت خروجی خام مدل (Logits)
             out = self.models[i](x_n)
             if isinstance(out, (tuple, list)): 
                 out = out[0]
-            
-            # 3. تبدیل خروجی خام به احتمال (Probability) با Sigmoid
-            # استفاده از float() برای جلوگیری از مشکلات احتمالی با Mixed Precision (fp16)
             prob = torch.sigmoid(out.float()) 
             probs_list.append(prob)
         
-        # 4. میانگین‌گیری از احتمالات (Standard Soft Voting)
-        # stack(..., dim=0) باعث میشه یک بُعد جدید برای مدل‌ها ساخته بشه
-        # mean(dim=0) میانگین احتمالات همه مدل‌ها رو برای هر نمونه دیتا حساب می‌کنه
         final_probs = torch.mean(torch.stack(probs_list, dim=0), dim=0)
-        
         return final_probs, None
 
-# ================== UNIFIED FINAL EVALUATION (آپدیت شده با محاسبه زمان) ==================
+# ================== UNIFIED FINAL EVALUATION (دقت ۱۰۰٪ مشابه) ==================
 @torch.no_grad()
 def final_evaluation_unified(model, test_loader, device, save_dir, model_name, args, is_main, is_ensemble=True):
     if not is_main: return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -252,15 +235,13 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     TP, TN, FP, FN = 0, 0, 0, 0
     correct_count, total_samples = 0, 0
 
-    # ======= وارم‌آپ قبل از اندازه‌گیری زمان (فقط GPU) =======
-    # چند forward اولیه برای جلوگیری از احتساب overhead مقداردهی اولیه‌ی
-    # CUDA context و کش‌نشدن کرنل‌ها در میانگین زمان استنتاج
-    if device.type == 'cuda':
-        dummy_input = torch.randn(1, 3, 256, 256).to(device)
-        for _ in range(5):
-            _ = model(dummy_input)
+    # ✅ وارم‌آپ با داده واقعی (بدون تغییر RNG state)
+    if device.type == 'cuda' and len(test_loader) > 0:
+        sample_batch = next(iter(test_loader))
+        warmup_input = sample_batch[0][:1].to(device)
+        for _ in range(3):
+            _ = model(warmup_input)
         torch.cuda.synchronize()
-    # ========================================================
 
     total_inference_time_ms = 0.0
 
@@ -270,7 +251,6 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
         images = images.to(device)
         labels_int = labels.long().tolist()
         
-        # ======= اندازه‌گیری زمان فقط دور forward pass =======
         if device.type == 'cuda':
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
@@ -292,7 +272,6 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
             total_inference_time_ms += start_event.elapsed_time(end_event)
         else:
             total_inference_time_ms += (time.time() - start_time) * 1000.0
-        # ========================================================
             
         for prob, label_int in zip(probs, labels_int):
             pred_int = int(prob > 0.5)
@@ -303,19 +282,17 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
             if pred_int == label_int: 
                 correct_count += 1
             
-            if label_int == 1:  # Real = 1
+            if label_int == 1:
                 if pred_int == 1: TP += 1
                 else: FN += 1
-            else:               # Fake = 0
+            else:
                 if pred_int == 1: FP += 1
                 else: TN += 1
             total_samples += 1
 
-    # محاسبه میانگین زمان و FPS
     avg_time_per_sample_ms = total_inference_time_ms / total_samples if total_samples > 0 else 0
     fps = 1000.0 / avg_time_per_sample_ms if avg_time_per_sample_ms > 0 else 0
 
-    # محاسبه متریک‌ها
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
     
@@ -323,27 +300,24 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
     f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
     
-    # محاسبه AUC
     auc_score = roc_auc_score(all_y_true, all_y_score)
     
     if is_ensemble:
         print(f"\n{'='*70}")
         print(f"FINAL RESULTS - {model_name}")
         print(f"Accuracy:  {acc*100:.2f}%")
-        print(f"Precision: {precision:.4f} (دفعت در تشخیص Real)")
-        print(f"Recall:    {recall:.4f} (حساسیت در تشخیص Real)")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall:    {recall:.4f}")
         print(f"F1-Score:  {f1_score:.4f}")
         print(f"AUC Score: {auc_score:.4f}")
         
-        # ✅ چاپ زمان استنتاج
-        print(f"\nInference Time Statistics (model forward pass only):")
+        print(f"\nInference Time Statistics:")
         print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
         print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
-        print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
+        print(f"  Throughput:     {fps:.2f} FPS")
         
         print(f"{'='*70}")
         
-        # ذخیره در JSON
         roc_json_path = os.path.join(save_dir, "roc_data_test.json")
         roc_data_json = {
             "metadata": {
@@ -360,9 +334,8 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
         }
         with open(roc_json_path, 'w', encoding='utf-8') as f: 
             json.dump(roc_data_json, f, indent=2)
-        print(f"✅ ROC data (including metrics) saved to: {roc_json_path}")
+        print(f"✅ ROC data saved to: {roc_json_path}")
 
-    # ✅ بازگرداندن ۷ مقدار (۴ متریک اصلی + ۳ متریک زمانی)
     return acc * 100, precision, recall, f1_score, total_inference_time_ms, avg_time_per_sample_ms, fps
 
 # ================== MODEL LOADING (بدون تغییر) ==================
@@ -403,7 +376,7 @@ def load_kd_models(model_paths: List[str], device: torch.device, is_main: bool) 
     if len(models) == 0: raise ValueError("No models loaded!")
     return models
 
-# ================== MAIN FUNCTION ==================
+# ================== MAIN FUNCTION (بدون تغییر) ==================
 def main():
     parser = argparse.ArgumentParser(description="Paper KD Ensemble")
     parser.add_argument('--batch_size', type=int, default=32)
@@ -460,7 +433,6 @@ def main():
                     if isinstance(out, (tuple, list)): out = out[0]
                     pred = (torch.sigmoid(out.squeeze()) > 0.5).long()
                     
-                    # محاسبه ماتریس درهم‌ریختگی برای هر مدل تکی
                     labels_cpu = labels.long().cpu()
                     pred_cpu = pred.cpu()
                     
@@ -492,7 +464,6 @@ def main():
         
         ensemble = PaperKDEnsemble(base_models, MEANS, STDS).to(device)
         
-        # ✅ دریافت ۷ خروجی از تابع ارزیابی
         ensemble_acc, ensemble_prec, ensemble_rec, ensemble_f1, total_time, avg_time, fps = final_evaluation_unified(
             ensemble, test_loader, device, args.save_dir, 
             "Paper KD Ensemble", args, is_main, is_ensemble=True
@@ -522,7 +493,6 @@ def main():
             },
             'accuracy_improvement': float(ensemble_acc - best_single_acc),
             'f1_improvement': float(ensemble_f1 - best_single_f1),
-            # ✅ ذخیره آمار سرعت در فایل JSON
             'inference_stats': {
                 'total_time_sec': float(total_time / 1000),
                 'avg_time_per_sample_ms': float(avg_time),
