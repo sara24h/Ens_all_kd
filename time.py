@@ -235,12 +235,11 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_name, a
     TP, TN, FP, FN = 0, 0, 0, 0
     correct_count, total_samples = 0, 0
 
-    # ✅ وارم‌آپ با داده واقعی (بدون تغییر RNG state)
-    if device.type == 'cuda' and len(test_loader) > 0:
-        sample_batch = next(iter(test_loader))
-        warmup_input = sample_batch[0][:1].to(device)
+    # ✅ وارم‌آپ با tensor ثابت (بدون تغییر RNG state و بدون مصرف batch)
+    if device.type == 'cuda':
+        dummy_input = torch.ones(1, 3, 256, 256, device=device)
         for _ in range(3):
-            _ = model(warmup_input)
+            _ = model(dummy_input)
         torch.cuda.synchronize()
 
     total_inference_time_ms = 0.0
